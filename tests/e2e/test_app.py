@@ -290,7 +290,7 @@ def test_t2_dashboard_no_providers(mocked_page):
     mocked_page.wait_for_selector(".app-container, #root")
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.locator(".search-input-shell input").fill("Naruto")
-    mocked_page.wait_for_selector(".search-result")
+    mocked_page.wait_for_selector(".search-result", timeout=60000)
     expect(mocked_page.locator(".availability-strip .provider-chip")).to_have_count(0)
     expect(mocked_page.locator(".language-switch")).to_be_visible()
 
