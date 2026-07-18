@@ -20,7 +20,7 @@ Reconsider only if the native app no longer shares the core, maintenance becomes
 
 **Status:** Accepted with hardening.
 
-Use SQLite with WAL, foreign keys, busy timeout, short transactions, consistent backups, and one application replica. It fits 5–10 users and keeps recovery simple.
+Use SQLite with WAL, foreign keys, busy timeout, short transactions, consistent backups, and one application replica. It keeps the initial system cheap and recovery simple without encoding a user-count ceiling.
 
 Move to PostgreSQL for multiple writers/replicas, remote database hosting, persistent lock contention, or point-in-time recovery requirements.
 
@@ -47,3 +47,11 @@ Reconsider if the repository becomes private and unauthenticated API polling no 
 AniList owns discovery metadata and cached ranking inputs. Explicitly selected providers own catalog results, episodes, and streams. Personal-match sorting operates locally over cached data.
 
 This boundary prevents misleading availability, hidden provider switching, and unnecessary AniList calls.
+
+## ADR-007 — scale by measured resource, not account count
+
+**Status:** Accepted.
+
+Publish a tested concurrency envelope for the deployed hardware and connection. Scale bandwidth delivery, compute, database, and topology independently according to the first measured saturation point. Account count alone is not a capacity metric.
+
+Reconsider the modular monolith or repository layout only when profiling shows that independent scaling or ownership would remove a real constraint.

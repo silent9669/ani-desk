@@ -11,7 +11,7 @@ Keep the existing stack and turn it into a well-bounded modular monolith:
 - Caddy for TLS, HTTP/2/3, reverse proxying, access logs, and edge security headers.
 - systemd timers for CI-gated updates, DDNS, and scheduled backup verification.
 
-This preserves the working native/web transport abstraction and provider code. A rewrite to Next.js, Node, Go, or separate frontend/backend repositories would add migration risk without improving a 5–10-user deployment.
+This preserves the working native/web transport abstraction and provider code. A rewrite to Next.js, Node, Go, or separate frontend/backend repositories is not the starting recommendation because it would duplicate the hardest asset—the provider core—without resolving the likely bottlenecks of upstream reliability and media bandwidth. The decision is evidence-based, not permanent; measurable rewrite triggers live in `08-capacity-cost-evolution.md`.
 
 ## Internal modules
 
@@ -51,7 +51,7 @@ Choose one exposure mode:
 
 ## Storage
 
-Stay on SQLite while there is one application replica and family-scale concurrency. Configure WAL, foreign keys, and a busy timeout on every connection. Keep database and download storage on persistent local disks, not the container filesystem.
+Stay on SQLite while there is one application replica and low write contention. Configure WAL, foreign keys, and a busy timeout on every connection. Keep database and download storage on persistent local disks, not the container filesystem.
 
 Move to PostgreSQL only if one of these becomes true:
 
@@ -80,4 +80,4 @@ Do not add Redis while sessions and rate limits fit one process. If horizontal s
 
 ## Resource starting point
 
-Start with 2 vCPU, 2–4 GB RAM, 20 GB system disk, and separate persistent space for databases/backups/downloads. Measure bandwidth and disk use before resizing. The application itself is small; concurrent proxied media determines network capacity.
+Start with 2 vCPU, 2–4 GB RAM, 20 GB system disk, and separate persistent space for databases/backups/downloads. Measure bandwidth and disk use before resizing. The application itself is small; concurrent proxied media determines network capacity. Never promise a user-count limit from these numbers alone—publish a tested concurrent-stream envelope for the actual connection and hardware.

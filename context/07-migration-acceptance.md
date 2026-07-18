@@ -40,6 +40,15 @@ Exit gate: at least one certified English and one certified Vietnamese end-to-en
 
 Exit gate: a clean VM can be recovered from repository + secrets + backup using only the runbook.
 
+## Phase 4.5 — measure the sustainable envelope
+
+- Run API and playback load profiles from `08-capacity-cost-evolution.md` against staging.
+- Record CPU, memory, disk latency, network throughput, open files, request latency, and error rate.
+- Establish a tested concurrent-stream ceiling and an alert threshold below it.
+- Confirm that provider rate limits and cache behavior degrade safely rather than amplifying requests.
+
+Exit gate: the owner has a dated capacity report, a cost baseline, and a scale action tied to each exhausted resource.
+
 ## Phase 5 — owner-approved production cutover
 
 - Freeze the approved commit SHA.
@@ -84,3 +93,4 @@ docker compose --env-file deploy/homelab/.env.example \
 - Health/readiness, logs, backups, restore, rollback, alerts, and deployment SHA are observable from the command line.
 - Secrets and state are absent from Git and container layers.
 - Production is not changed until owner approval.
+- Capacity and cost claims are backed by a repeatable test, not an assumed audience size.

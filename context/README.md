@@ -11,7 +11,9 @@ This folder is the handoff contract for building and operating the hosted ani-de
 5. [05-network-security.md](05-network-security.md) — exposure model, identity, secrets, and hardening.
 6. [06-deploy-operate-monitor.md](06-deploy-operate-monitor.md) — command-line deployment and operations runbook.
 7. [07-migration-acceptance.md](07-migration-acceptance.md) — delivery phases and release gates.
-8. [decisions/README.md](decisions/README.md) — architecture decisions and reconsideration triggers.
+8. [08-capacity-cost-evolution.md](08-capacity-cost-evolution.md) — sustainable growth, cost controls, load gates, and rewrite triggers.
+9. [09-build-handoff.md](09-build-handoff.md) — practical implementation order and evidence expected from a future builder.
+10. [decisions/README.md](decisions/README.md) — architecture decisions and reconsideration triggers.
 
 ## Source-of-truth order
 
@@ -33,6 +35,7 @@ Before implementation, inspect the actual versions in `Cargo.lock` and `package-
 - Keep AllAnime visible when blocked and offer a clear manual-verification path.
 - Never expose provider stream URLs or required provider headers directly to the browser.
 - Do not deploy automatically while redesign or provider behavior is still awaiting owner validation.
+- Treat the first family cohort as a starting load, not an architectural ceiling; scale from measured bottlenecks.
 - Do not commit `.env`, databases, certificates, download files, or backup archives.
 
 ## Existing references

@@ -2,7 +2,7 @@
 
 ## Audience
 
-ani-web is the hosted, responsive edition of ani-desk for one family: approximately 5–10 named users on macOS, iPhone, iPad, and ordinary web browsers. It is a private media client, not a public streaming platform or multi-tenant SaaS product.
+ani-web is the hosted, responsive edition of ani-desk. It starts as a private client for one family on macOS, iPhone, iPad, and ordinary web browsers, but the implementation must not embed a 5–10-user ceiling. It is not initially a public streaming platform or multi-tenant SaaS product.
 
 ## Required user journeys
 
@@ -44,6 +44,8 @@ Priority order:
 - A universal merged search ranking that hides the chosen provider.
 - Native iOS distribution as a prerequisite; responsive/PWA behavior comes first.
 
-## Capacity assumption
+## Initial workload, not a ceiling
 
-Design for 5–10 accounts, normally 1–3 simultaneous playback sessions, and a single homelab node. Media proxy bandwidth—not API or database compute—is the likely bottleneck. Capacity tests should therefore include concurrent HLS playback and WAN upload/download measurements.
+The first deployment is expected to have 5–10 accounts, normally 1–3 simultaneous playback sessions, and one homelab node. Design and tests must also define the safe limit of that node. Media proxy bandwidth—not API or database compute—is the likely first bottleneck, so capacity evidence must include concurrent HLS playback, WAN upload/download, open file descriptors, memory, and provider request behavior.
+
+Growth should be incremental: optimize caching and direct delivery first, resize the single node second, move durable state to PostgreSQL before adding replicas, and split services only when measurements prove independent scaling is valuable.
