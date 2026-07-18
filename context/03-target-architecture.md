@@ -81,4 +81,3 @@ Do not add Redis while sessions and rate limits fit one process. If horizontal s
 ## Resource starting point
 
 Start with 2 vCPU, 2–4 GB RAM, 20 GB system disk, and separate persistent space for databases/backups/downloads. Measure bandwidth and disk use before resizing. The application itself is small; concurrent proxied media determines network capacity.
-

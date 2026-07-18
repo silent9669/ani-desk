@@ -47,4 +47,3 @@ Reconsider if the repository becomes private and unauthenticated API polling no 
 AniList owns discovery metadata and cached ranking inputs. Explicitly selected providers own catalog results, episodes, and streams. Personal-match sorting operates locally over cached data.
 
 This boundary prevents misleading availability, hidden provider switching, and unnecessary AniList calls.
-

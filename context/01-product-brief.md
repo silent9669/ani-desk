@@ -47,4 +47,3 @@ Priority order:
 ## Capacity assumption
 
 Design for 5–10 accounts, normally 1–3 simultaneous playback sessions, and a single homelab node. Media proxy bandwidth—not API or database compute—is the likely bottleneck. Capacity tests should therefore include concurrent HLS playback and WAN upload/download measurements.
-

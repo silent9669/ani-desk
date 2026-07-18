@@ -43,4 +43,3 @@ Before implementation, inspect the actual versions in `Cargo.lock` and `package-
 - `server/src/main.rs` and `server/src/db.rs` — hosted API and identity/data implementation.
 - `web/src/api.ts` and `web/src/types.ts` — browser/native transport abstraction and shared DTOs.
 - `src/providers/mod.rs` — provider adapter interface and registry.
-

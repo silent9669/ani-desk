@@ -129,4 +129,3 @@ Prometheus/Grafana/cAdvisor and Loki are optional. Add them only if the homelab 
 5. Distinguish local service failure from AniList/provider failure.
 6. Inspect deployed SHA and latest approved CI run.
 7. Roll back code if the failure began after deployment; restore data only with evidence of data/schema damage.
-

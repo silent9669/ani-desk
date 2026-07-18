@@ -65,4 +65,3 @@ The current database connection enables foreign keys but does not explicitly con
 - The deployment scripts assume a specific Linux user, LAN subnet, domain, paths, repository, and `master` branch. Parameterize or consciously retain these values for the target homelab.
 - SQLite backup is consistent because the pull agent stops the application first. Any future online backup must use SQLite's backup mechanism rather than copying live database files.
 - In-memory login limits and media sessions disappear after a restart and do not work across multiple application replicas.
-

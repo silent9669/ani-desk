@@ -64,4 +64,3 @@ Retain application and access logs for a small bounded period. Provider breakage
 - Verify login throttling at both application and edge.
 - Scan the Git history and built image for secrets.
 - Test backup restore on a clean VM.
-

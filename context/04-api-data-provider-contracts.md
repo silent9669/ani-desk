@@ -68,4 +68,3 @@ AllAnime must remain selectable when direct access is blocked. Report `verificat
 ## Personal-match contract
 
 Personal match is local and deterministic for a given cached catalog plus user library. Store or derive only compact preference weights. The UI may re-sort/filter this cached set without an AniList call. Tests should freeze metadata and user history so ranking changes are reviewable.
-
