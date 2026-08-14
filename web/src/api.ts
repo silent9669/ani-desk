@@ -15,6 +15,7 @@ import type {
   Playback,
   ProviderAvailability,
   SessionUser,
+  SkipTime,
   Source,
   WatchHistory,
 } from "./types";
@@ -87,13 +88,6 @@ export const api = {
   retryProviderHealth: (provider?: string) => isNativeRuntime()
     ? invoke<Source[]>("retry_provider_health", { provider })
     : webPost<Source[]>("/providers/health", { provider }),
-  openProviderAccess: async (provider: string) => {
-    if (isNativeRuntime()) return invoke<void>("open_provider_access", { provider });
-    window.open(`/api/providers/access?provider=${encodeURIComponent(provider)}`, "_blank", "noopener,noreferrer");
-  },
-  completeProviderVerification: (provider: string) => isNativeRuntime()
-    ? invoke<Source[]>("complete_provider_verification", { provider })
-    : webPost<Source[]>("/providers/health", { provider }),
   getDiscovery: () => isNativeRuntime() ? invoke<DiscoveryCatalog>("get_discovery") : webRequest<DiscoveryCatalog>("/discovery"),
   getGenreCatalog: (genre: string) => isNativeRuntime()
     ? invoke<CatalogAnime[]>("get_genre_catalog", { genre })
@@ -125,6 +119,9 @@ export const api = {
   preparePlayback: (provider: string, episodeId: string) => isNativeRuntime()
     ? invoke<Playback>("prepare_playback", { provider, episodeId })
     : webPost<Playback>("/playback", { provider, episodeId }),
+  getSkipTimes: (catalogId: number, episodeNumber: number) => isNativeRuntime()
+    ? invoke<SkipTime[]>("get_skip_times", { input: { catalogId, episodeNumber } })
+    : webPost<SkipTime[]>("/skip-times", { catalogId, episodeNumber }),
   downloadEpisode: async (
     request: {
       id: string;

@@ -1,25 +1,30 @@
 mod db;
 
 use ani_desk_core::{
-    catalog::{CatalogClient, CatalogFilters},
+    catalog::{
+        apply_personal_matches, CatalogAnime, CatalogClient, CatalogFilters, TastePreference,
+    },
     config::Config,
     db::Database,
     metadata::MetadataCache,
-    providers::{Anime, AnimeProvider, Language, ProviderRegistry, StreamInfo},
+    providers::{
+        best_title_match, normalize_title, Anime, AnimeProvider, Language, ProviderRegistry,
+        StreamInfo, SubtitleFormat,
+    },
+    skip_times::{fetch_skip_times, SkipTime},
 };
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use db::{NewFavorite, NewHistory, SessionUser, WebDatabase};
-use futures_util::TryStreamExt;
+use futures_util::{future::join_all, FutureExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use reqwest::{header::HeaderMap as ReqwestHeaderMap, Client, Url};
@@ -30,8 +35,9 @@ use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -45,11 +51,11 @@ use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "ani_desk_session";
 const MAX_MEDIA_SESSIONS: usize = 2_048;
-const MAX_MEDIA_RESOURCES: usize = 4_096;
-const MEDIA_RESOURCE_TTL: Duration = Duration::from_secs(30 * 60);
 const LOGIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_ATTEMPT_LIMIT: usize = 8;
 const LOGIN_ATTEMPT_KEY_LIMIT: usize = 10_000;
+const PROVIDER_HEALTH_TTL: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AppState {
@@ -61,7 +67,15 @@ struct AppState {
     login_attempts: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     download_tickets: Arc<Mutex<HashMap<String, DownloadTicket>>>,
     media_sessions: Arc<Mutex<HashMap<String, MediaSession>>>,
+    provider_health: Arc<Mutex<ProviderHealthCache>>,
+    provider_health_refresh: Arc<Mutex<()>>,
     media_client: Client,
+}
+
+#[derive(Default)]
+struct ProviderHealthCache {
+    checked_at: Option<Instant>,
+    health: Vec<SourceDto>,
 }
 
 #[derive(Clone)]
@@ -78,16 +92,23 @@ struct MediaSession {
     expires_at: Instant,
     stream: StreamInfo,
     secret: [u8; 32],
-    resources: Arc<Mutex<HashMap<String, MediaResource>>>,
+    resources: Arc<StdMutex<HashMap<String, MediaResource>>>,
 }
 
 #[derive(Clone)]
 struct MediaResource {
     url: Url,
-    inserted_at: Instant,
+    allow_relative_paths: bool,
+    transform: MediaTransform,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTransform {
+    None,
+    AssToWebVtt,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiErrorBody {
     code: String,
@@ -224,6 +245,13 @@ struct PlaybackInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SkipTimesInput {
+    catalog_id: i64,
+    episode_number: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AnimeInput {
     id: String,
     catalog_id: Option<i64>,
@@ -265,17 +293,7 @@ struct RemoveInput {
     anime_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ProviderQuery {
-    provider: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResourceQuery {
-    token: String,
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SourceDto {
     name: String,
@@ -285,7 +303,6 @@ struct SourceDto {
     failure_code: Option<String>,
     capabilities: ani_desk_core::providers::ProviderCapabilities,
     website_url: Option<String>,
-    verification_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,11 +344,9 @@ struct AvailabilityDto {
 struct PlaybackDto {
     session_id: String,
     playback_url: String,
-    original_url: String,
     stream_kind: String,
     subtitles: Vec<SubtitleDto>,
     qualities: Vec<String>,
-    can_fallback_to_mpv: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -368,6 +383,8 @@ async fn main() -> Result<()> {
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         download_tickets: Arc::new(Mutex::new(HashMap::new())),
         media_sessions: Arc::new(Mutex::new(HashMap::new())),
+        provider_health: Arc::new(Mutex::new(ProviderHealthCache::default())),
+        provider_health_refresh: Arc::new(Mutex::new(())),
         media_client: Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(6 * 60 * 60))
@@ -387,7 +404,6 @@ async fn main() -> Result<()> {
             "/providers/health",
             get(list_provider_health).post(retry_provider_health),
         )
-        .route("/providers/access", get(provider_access))
         .route("/discovery", get(discovery))
         .route("/catalog/search", get(search_catalog))
         .route("/catalog/genre/:genre", get(genre_catalog))
@@ -397,9 +413,13 @@ async fn main() -> Result<()> {
         .route("/anime/details", post(anime_details))
         .route("/anime/episodes", post(episodes))
         .route("/playback", post(playback))
+        .route("/skip-times", post(skip_times))
         .route("/media/:id", get(media_main))
-        .route("/media/:id/resource", get(media_resource))
-        .route("/media/:id/dash/*path", get(media_dash_resource))
+        .route("/media/:id/resource/:resource_id", get(media_resource))
+        .route(
+            "/media/:id/resource/:resource_id/*path",
+            get(media_resource_path),
+        )
         .route("/history", get(history).post(save_progress))
         .route("/history/remove", post(remove_history))
         .route("/my-list", get(my_list).post(add_favorite))
@@ -415,6 +435,7 @@ async fn main() -> Result<()> {
         .nest("/api", api)
         .fallback_service(static_files)
         .with_state(state)
+        .layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache")))
         .layer(SetResponseHeaderLayer::if_not_present(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
         .layer(SetResponseHeaderLayer::if_not_present(HeaderName::from_static("strict-transport-security"), HeaderValue::from_static("max-age=31536000; includeSubDomains")))
         .layer(SetResponseHeaderLayer::if_not_present(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin")))
@@ -642,23 +663,35 @@ async fn list_sources(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<SourceDto>>> {
     require_user(&state, &headers).await?;
-    Ok(Json(
-        state
-            .providers
-            .list_providers()
+    let cached = state.provider_health.lock().await;
+    let mut sources = source_list(&state);
+    for source in &mut sources {
+        if let Some(health) = cached
+            .health
             .iter()
-            .map(|provider| SourceDto {
-                name: provider.name().into(),
-                language: language_label(provider.language()).into(),
-                language_group: language_group(provider.language()).into(),
-                status: "unknown".into(),
-                failure_code: None,
-                capabilities: provider.capabilities(),
-                website_url: provider.website_url().map(str::to_string),
-                verification_url: provider.verification_url().map(str::to_string),
-            })
-            .collect(),
-    ))
+            .find(|health| health.name == source.name)
+        {
+            *source = health.clone();
+        }
+    }
+    Ok(Json(sources))
+}
+
+fn source_list(state: &AppState) -> Vec<SourceDto> {
+    state
+        .providers
+        .list_providers()
+        .iter()
+        .map(|provider| SourceDto {
+            name: provider.name().into(),
+            language: language_label(provider.language()).into(),
+            language_group: language_group(provider.language()).into(),
+            status: "unknown".into(),
+            failure_code: None,
+            capabilities: provider.capabilities(),
+            website_url: provider.website_url().map(str::to_string),
+        })
+        .collect()
 }
 
 fn source_dto(
@@ -674,7 +707,6 @@ fn source_dto(
         failure_code,
         capabilities: provider.capabilities(),
         website_url: provider.website_url().map(str::to_string),
-        verification_url: provider.verification_url().map(str::to_string),
     }
 }
 
@@ -683,7 +715,30 @@ async fn list_provider_health(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<SourceDto>>> {
     require_user(&state, &headers).await?;
-    Ok(Json(check_provider_health(&state, None).await?))
+    {
+        let cache = state.provider_health.lock().await;
+        if cache
+            .checked_at
+            .is_some_and(|checked_at| checked_at.elapsed() < PROVIDER_HEALTH_TTL)
+        {
+            return Ok(Json(cache.health.clone()));
+        }
+    }
+
+    let _refresh = state.provider_health_refresh.lock().await;
+    let cache = state.provider_health.lock().await;
+    if cache
+        .checked_at
+        .is_some_and(|checked_at| checked_at.elapsed() < PROVIDER_HEALTH_TTL)
+    {
+        return Ok(Json(cache.health.clone()));
+    }
+    drop(cache);
+    let health = check_provider_health(&state, None).await?;
+    let mut cache = state.provider_health.lock().await;
+    cache.checked_at = Some(Instant::now());
+    cache.health = health.clone();
+    Ok(Json(health))
 }
 
 async fn retry_provider_health(
@@ -693,9 +748,23 @@ async fn retry_provider_health(
 ) -> ApiResult<Json<Vec<SourceDto>>> {
     require_app_request(&headers)?;
     require_user(&state, &headers).await?;
-    Ok(Json(
-        check_provider_health(&state, input.provider.as_deref()).await?,
-    ))
+    let health = check_provider_health(&state, input.provider.as_deref()).await?;
+    let mut cache = state.provider_health.lock().await;
+    for update in &health {
+        if let Some(current) = cache
+            .health
+            .iter_mut()
+            .find(|item| item.name == update.name)
+        {
+            *current = update.clone();
+        } else {
+            cache.health.push(update.clone());
+        }
+    }
+    if input.provider.is_none() {
+        cache.checked_at = Some(Instant::now());
+    }
+    Ok(Json(health))
 }
 
 async fn check_provider_health(
@@ -712,80 +781,52 @@ async fn check_provider_health(
         ));
     }
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for provider in state.providers.list_providers() {
-        if selected.is_some_and(|name| name != provider.name()) {
-            continue;
-        }
-        let provider = provider.clone();
-        tasks.spawn(async move {
-            let result = provider.health_check().await;
+    let checks = state
+        .providers
+        .list_providers()
+        .iter()
+        .filter(|provider| selected.is_none_or(|name| name == provider.name()))
+        .cloned()
+        .map(|provider| async move {
+            let result = tokio::time::timeout(
+                PROVIDER_HEALTH_TIMEOUT,
+                AssertUnwindSafe(provider.health_check()).catch_unwind(),
+            )
+            .await;
             match result {
-                Ok(()) => source_dto(provider.as_ref(), "healthy", None),
-                Err(error) => source_dto(
+                Ok(Ok(Ok(()))) => source_dto(provider.as_ref(), "healthy", None),
+                Ok(Ok(Err(error))) => source_dto(
                     provider.as_ref(),
                     "unavailable",
                     Some(classify_provider_error(&error.to_string()).into()),
                 ),
+                Ok(Err(_)) => source_dto(
+                    provider.as_ref(),
+                    "unavailable",
+                    Some("PROVIDER_UNAVAILABLE".into()),
+                ),
+                Err(_) => source_dto(
+                    provider.as_ref(),
+                    "unavailable",
+                    Some("NETWORK_TIMEOUT".into()),
+                ),
             }
         });
-    }
 
-    let mut health = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        health.push(result.map_err(|error| ApiError::internal("provider-health", error))?);
-    }
-    health.sort_by_key(|item| {
-        state
-            .providers
-            .list_providers()
-            .iter()
-            .position(|provider| provider.name() == item.name)
-            .unwrap_or(usize::MAX)
-    });
-    Ok(health)
-}
-
-async fn provider_access(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<ProviderQuery>,
-) -> ApiResult<Redirect> {
-    require_user(&state, &headers).await?;
-    let provider = state
-        .providers
-        .get_provider(&query.provider)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "PROVIDER_UNAVAILABLE",
-                "provider-access",
-                "Provider is not available.",
-                false,
-            )
-        })?;
-    let url = provider
-        .verification_url()
-        .or_else(|| provider.website_url())
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "PROVIDER_UNAVAILABLE",
-                "provider-access",
-                "Provider does not have a verification page.",
-                false,
-            )
-        })?;
-    Ok(Redirect::temporary(url))
+    Ok(join_all(checks).await)
 }
 
 async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    require_user(&state, &headers).await?;
-    Ok(Json(json!(state
+    let user = require_user(&state, &headers).await?;
+    let mut discovery = state
         .catalog
         .discovery()
         .await
-        .map_err(|error| ApiError::internal("catalog", error))?)))
+        .map_err(|error| ApiError::internal("catalog", error))?;
+    let preferences = catalog_preferences(&state, &user.id).await;
+    apply_personal_matches(&mut discovery.trending, &preferences);
+    apply_personal_matches(&mut discovery.popular_this_season, &preferences);
+    Ok(Json(json!(discovery)))
 }
 
 async fn search_catalog(
@@ -793,15 +834,14 @@ async fn search_catalog(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> ApiResult<Json<Value>> {
-    require_user(&state, &headers).await?;
-    Ok(Json(json!(state
+    let user = require_user(&state, &headers).await?;
+    let mut items = state
         .catalog
         .search(query.query.trim(), 24)
         .await
-        .map_err(|error| ApiError::internal(
-            "catalog-search",
-            error
-        ))?)))
+        .map_err(|error| ApiError::internal("catalog-search", error))?;
+    personalize_catalog_items(&state, &user.id, &mut items).await;
+    Ok(Json(json!(items)))
 }
 
 async fn genre_catalog(
@@ -809,12 +849,14 @@ async fn genre_catalog(
     headers: HeaderMap,
     Path(genre): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    require_user(&state, &headers).await?;
-    Ok(Json(json!(state
+    let user = require_user(&state, &headers).await?;
+    let mut items = state
         .catalog
         .by_genre(&genre, 24)
         .await
-        .map_err(|error| ApiError::internal("catalog", error))?)))
+        .map_err(|error| ApiError::internal("catalog", error))?;
+    personalize_catalog_items(&state, &user.id, &mut items).await;
+    Ok(Json(json!(items)))
 }
 
 async fn catalog(
@@ -822,12 +864,82 @@ async fn catalog(
     headers: HeaderMap,
     Json(input): Json<CatalogInput>,
 ) -> ApiResult<Json<Value>> {
-    require_user(&state, &headers).await?;
-    Ok(Json(json!(state
+    let user = require_user(&state, &headers).await?;
+    let mut page = state
         .catalog
         .catalog(&input.filters, &input.sort, input.page.unwrap_or(1), 24)
         .await
-        .map_err(|error| ApiError::internal("catalog", error))?)))
+        .map_err(|error| ApiError::internal("catalog", error))?;
+    personalize_catalog_items(&state, &user.id, &mut page.items).await;
+    Ok(Json(json!(page)))
+}
+
+async fn personalize_catalog_items(state: &AppState, user_id: &str, items: &mut [CatalogAnime]) {
+    let preferences = catalog_preferences(state, user_id).await;
+    apply_personal_matches(items, &preferences);
+}
+
+async fn catalog_preferences(state: &AppState, user_id: &str) -> Vec<TastePreference> {
+    let histories = state.db.history(user_id, 100).await.unwrap_or_default();
+    let favorites = state.db.favorites(user_id, 100).await.unwrap_or_default();
+    let mut weighted_ids = HashMap::<i64, f64>::new();
+
+    for history in &histories {
+        if let Some(catalog_id) = history.catalog_id {
+            let progress = if history.total_seconds > 0 {
+                history.position_seconds as f64 / history.total_seconds as f64
+            } else {
+                0.0
+            };
+            *weighted_ids.entry(catalog_id).or_default() += 1.0 + 2.0 * progress.clamp(0.0, 1.0);
+        }
+    }
+    for favorite in &favorites {
+        if let Some(catalog_id) = favorite.catalog_id {
+            *weighted_ids.entry(catalog_id).or_default() += 3.0;
+        }
+    }
+
+    // Older rows may predate catalog IDs. Resolve only a few per request so
+    // existing user data contributes without adding unbounded network work.
+    let unresolved = histories
+        .iter()
+        .filter(|item| item.catalog_id.is_none())
+        .map(|item| (item.title.as_str(), 1.0))
+        .chain(
+            favorites
+                .iter()
+                .filter(|item| item.catalog_id.is_none())
+                .map(|item| (item.title.as_str(), 3.0)),
+        )
+        .take(4);
+    for (title, weight) in unresolved {
+        if let Ok(matches) = state.catalog.search(title, 3).await {
+            if let Some(item) = matches
+                .into_iter()
+                .find(|item| normalize_title(&item.title) == normalize_title(title))
+            {
+                *weighted_ids.entry(item.catalog_id).or_default() += weight;
+            }
+        }
+    }
+
+    let metadata = state
+        .catalog
+        .by_ids(&weighted_ids.keys().copied().collect::<Vec<_>>())
+        .await
+        .unwrap_or_default();
+    metadata
+        .into_iter()
+        .filter_map(|item| {
+            weighted_ids
+                .get(&item.catalog_id)
+                .map(|weight| TastePreference {
+                    genres: item.genres,
+                    weight: *weight,
+                })
+        })
+        .collect()
 }
 
 async fn availability(
@@ -842,15 +954,15 @@ async fn availability(
         if input
             .language_group_filter
             .as_deref()
-            .is_some_and(|group| group != language_group(provider.language()))
+            .is_some_and(|group| !group.eq_ignore_ascii_case(language_group(provider.language())))
         {
             continue;
         }
         let result = provider.search(input.title.trim()).await;
         let (status, failure_code, anime) = match result {
             Ok(items) => {
-                let selected =
-                    best_title_match(items, &input.title).map(|anime| map_anime(anime, None));
+                let selected = best_title_match(items, std::slice::from_ref(&input.title))
+                    .map(|anime| map_anime(anime, Some(input.catalog_id)));
                 if selected.is_some() {
                     ("available".into(), None, selected)
                 } else {
@@ -988,18 +1100,15 @@ async fn playback(
     let id = Uuid::new_v4().to_string();
     let mut secret = [0_u8; 32];
     OsRng.fill_bytes(&mut secret);
-    let mut resources = HashMap::new();
-    let subtitles = stream
-        .subtitles
-        .iter()
-        .filter_map(|subtitle| {
-            Url::parse(&subtitle.url).ok().map(|url| SubtitleDto {
-                language: subtitle.language.clone(),
-                url: registered_resource_url(&id, &secret, &mut resources, &url),
-            })
-        })
-        .collect();
     let now = Instant::now();
+    let session = MediaSession {
+        user_id: user.id,
+        expires_at: now + Duration::from_secs(6 * 60 * 60),
+        stream: stream.clone(),
+        secret,
+        resources: Arc::new(StdMutex::new(HashMap::new())),
+    };
+    let response = playback_dto(&id, &session);
     let mut sessions = state.media_sessions.lock().await;
     sessions.retain(|_, session| session.expires_at > now);
     while sessions.len() >= MAX_MEDIA_SESSIONS {
@@ -1012,33 +1121,72 @@ async fn playback(
         };
         sessions.remove(&oldest_id);
     }
-    sessions.insert(
-        id.clone(),
-        MediaSession {
-            user_id: user.id,
-            expires_at: now + Duration::from_secs(6 * 60 * 60),
-            stream: stream.clone(),
-            secret,
-            resources: Arc::new(Mutex::new(resources)),
-        },
-    );
-    let playback_url = format!("/api/media/{id}");
-    Ok(Json(PlaybackDto {
-        session_id: id.clone(),
-        playback_url: playback_url.clone(),
-        original_url: playback_url,
-        stream_kind: if stream.video_url.to_ascii_lowercase().contains(".m3u8") {
+    sessions.insert(id, session);
+    Ok(Json(response))
+}
+
+fn playback_dto(id: &str, session: &MediaSession) -> PlaybackDto {
+    let subtitles = session
+        .stream
+        .subtitles
+        .iter()
+        .filter_map(|subtitle| {
+            Url::parse(&subtitle.url).ok().map(|url| SubtitleDto {
+                language: subtitle.language.clone(),
+                url: opaque_subtitle_url(id, session, url, subtitle.format),
+            })
+        })
+        .collect();
+    PlaybackDto {
+        session_id: id.into(),
+        playback_url: format!("/api/media/{id}"),
+        stream_kind: if session
+            .stream
+            .video_url
+            .to_ascii_lowercase()
+            .contains(".m3u8")
+        {
             "hls"
-        } else if stream.video_url.to_ascii_lowercase().contains(".mpd") {
+        } else if session
+            .stream
+            .video_url
+            .to_ascii_lowercase()
+            .contains(".mpd")
+        {
             "dash"
         } else {
             "native"
         }
         .into(),
         subtitles,
-        qualities: stream.qualities,
-        can_fallback_to_mpv: false,
-    }))
+        qualities: session.stream.qualities.clone(),
+    }
+}
+
+async fn skip_times(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SkipTimesInput>,
+) -> ApiResult<Json<Vec<SkipTime>>> {
+    require_user(&state, &headers).await?;
+    let times = fetch_skip_times(input.catalog_id, input.episode_number)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                catalog_id = input.catalog_id,
+                episode_number = input.episode_number,
+                %error,
+                "AniSkip lookup failed"
+            );
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "ANISKIP_UNAVAILABLE",
+                "skip-times",
+                "Automatic skip times are temporarily unavailable.",
+                true,
+            )
+        })?;
+    Ok(Json(times))
 }
 
 async fn media_main(
@@ -1063,82 +1211,54 @@ async fn media_main(
 async fn media_resource(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(query): Query<ResourceQuery>,
+    Path((id, resource_id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let user = require_user(&state, &headers).await?;
     let session = get_media_session(&state, &id, &user.id).await?;
-    let url = session
-        .resources
-        .lock()
-        .await
-        .get(&query.token)
-        .map(|resource| resource.url.clone())
-        .ok_or_else(invalid_media_resource)?;
-    proxy_media_url(&state, &id, &session, url, &headers).await
+    let resource = resolve_media_resource(&session, &resource_id)?;
+    if resource.transform == MediaTransform::AssToWebVtt {
+        return proxy_ass_subtitle(&state, &session, resource.url).await;
+    }
+    proxy_media_url(&state, &id, &session, resource.url, &headers).await
 }
 
-async fn media_dash_resource(
+async fn media_resource_path(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, path)): Path<(String, String)>,
-    RawQuery(raw_query): RawQuery,
+    Path((id, resource_id, path)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
     let user = require_user(&state, &headers).await?;
     let session = get_media_session(&state, &id, &user.id).await?;
-    let Some(value) = path.strip_prefix("base/") else {
-        return Err(invalid_dash_resource());
-    };
-    let mut parts = value.splitn(2, '/');
-    let token = parts.next().unwrap_or_default();
-    let relative_path = parts.next().unwrap_or_default();
-    let base = session
-        .resources
-        .lock()
-        .await
-        .get(token)
-        .map(|resource| resource.url.clone())
-        .ok_or_else(invalid_dash_resource)?;
-    let mut upstream = resolve_dash_upstream(base, relative_path)?;
-    append_upstream_query(&mut upstream, raw_query.as_deref());
+    let upstream = resolve_opaque_resource(&session, &resource_id, Some(&path))?;
     proxy_media_url(&state, &id, &session, upstream, &headers).await
-}
-
-fn append_upstream_query(upstream: &mut Url, raw_query: Option<&str>) {
-    let Some(raw_query) = raw_query.filter(|query| !query.is_empty()) else {
-        return;
-    };
-    let combined = match upstream.query() {
-        Some(existing) if !existing.is_empty() => format!("{existing}&{raw_query}"),
-        _ => raw_query.to_string(),
-    };
-    upstream.set_query(Some(&combined));
 }
 
 fn resolve_dash_upstream(base: Url, relative_path: &str) -> ApiResult<Url> {
     let origin = base.origin();
+    let base_query = base.query().map(str::to_owned);
     let upstream = if relative_path.is_empty() {
         base
     } else {
-        base.join(relative_path)
-            .map_err(|_| invalid_dash_resource())?
+        let mut upstream = base
+            .join(relative_path)
+            .map_err(|_| invalid_media_resource())?;
+        if upstream.query().is_none() {
+            upstream.set_query(base_query.as_deref());
+        }
+        upstream
     };
     if upstream.origin() != origin {
-        return Err(invalid_dash_resource());
+        return Err(invalid_media_resource());
     }
     Ok(upstream)
 }
 
-fn invalid_dash_resource() -> ApiError {
-    invalid_media_resource()
-}
-
 fn invalid_media_resource() -> ApiError {
     ApiError::new(
-        StatusCode::BAD_REQUEST,
+        StatusCode::NOT_FOUND,
         "INVALID_MEDIA_RESOURCE",
         "playback",
-        "The media resource is invalid.",
+        "The media resource is invalid or expired.",
         false,
     )
 }
@@ -1175,6 +1295,9 @@ async fn proxy_media_url(
     url: Url,
     incoming: &HeaderMap,
 ) -> ApiResult<Response> {
+    if session.stream.use_curl {
+        return proxy_media_url_via_curl(session_id, session, url, incoming).await;
+    }
     let mut request = state
         .media_client
         .get(url.clone())
@@ -1228,9 +1351,7 @@ async fn proxy_media_url(
                     true,
                 )
             })?;
-        let mut resources = session.resources.lock().await;
-        let rewritten =
-            rewrite_hls_manifest(session_id, &session.secret, &url, &text, &mut resources);
+        let rewritten = rewrite_hls_manifest(session_id, session, &url, &text);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
@@ -1266,9 +1387,7 @@ async fn proxy_media_url(
                     true,
                 )
             })?;
-        let mut resources = session.resources.lock().await;
-        let rewritten =
-            rewrite_dash_manifest(session_id, &session.secret, &url, &text, &mut resources);
+        let rewritten = rewrite_dash_manifest(session_id, session, &url, &text);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/dash+xml; charset=utf-8")
@@ -1303,12 +1422,338 @@ async fn proxy_media_url(
         .map_err(|error| ApiError::internal("playback", error))
 }
 
+async fn proxy_media_url_via_curl(
+    session_id: &str,
+    session: &MediaSession,
+    url: Url,
+    incoming: &HeaderMap,
+) -> ApiResult<Response> {
+    let range = incoming
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let (status, content_type, body) =
+        curl_fetch(&url, &session.stream.headers, range.as_deref(), 600).await?;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "PROXY_FAILED",
+            "playback",
+            format!("upstream returned {status}"),
+            true,
+        ));
+    }
+    let hls = url.path().to_ascii_lowercase().contains(".m3u8") || content_type.contains("mpegurl");
+    if hls {
+        let text =
+            String::from_utf8(body).map_err(|error| ApiError::internal("playback", error))?;
+        let rewritten = rewrite_hls_manifest(session_id, session, &url, &text);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(rewritten))
+            .map_err(|error| ApiError::internal("playback", error));
+    }
+    let dash =
+        url.path().to_ascii_lowercase().contains(".mpd") || content_type.contains("dash+xml");
+    if dash {
+        let text =
+            String::from_utf8(body).map_err(|error| ApiError::internal("playback", error))?;
+        let rewritten = rewrite_dash_manifest(session_id, session, &url, &text);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/dash+xml; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(rewritten))
+            .map_err(|error| ApiError::internal("playback", error));
+    }
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, "private, no-store");
+    if !content_type.is_empty() {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(body))
+        .map_err(|error| ApiError::internal("playback", error))
+}
+
+async fn curl_fetch(
+    url: &Url,
+    headers: &std::collections::HashMap<String, String>,
+    range: Option<&str>,
+    max_time: u32,
+) -> ApiResult<(u16, String, Vec<u8>)> {
+    let mut args: Vec<String> = vec![
+        "-sS".into(),
+        "-L".into(),
+        "--max-redirs".into(),
+        "8".into(),
+        "--max-time".into(),
+        max_time.to_string(),
+    ];
+    for (name, value) in headers {
+        match name.to_ascii_lowercase().as_str() {
+            "user-agent" => {
+                args.push("-A".into());
+                args.push(value.clone());
+            }
+            "referer" => {
+                args.push("-e".into());
+                args.push(value.clone());
+            }
+            "accept" | "accept-encoding" | "connection" | "host" | "content-length" => {}
+            _ => args.extend(["-H".into(), format!("{name}: {value}")]),
+        }
+    }
+    if let Some(range) = range {
+        args.push("-H".into());
+        args.push(format!("Range: {range}"));
+    }
+    args.push("-w".into());
+    args.push("\n__ANI_DESK__%{http_code}__%{content_type}".into());
+    args.push(url.as_str().into());
+    let output = tokio::process::Command::new("curl")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "PROXY_FAILED",
+                "playback",
+                format!("curl failed: {error}"),
+                true,
+            )
+        })?;
+    let stdout = output.stdout;
+    const MARKER: &[u8] = b"__ANI_DESK__";
+    let (body, meta) = stdout
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .map_or((stdout.clone(), Vec::new()), |index| {
+            (
+                stdout[..index].to_vec(),
+                stdout[index + MARKER.len()..].to_vec(),
+            )
+        });
+    let meta = String::from_utf8_lossy(&meta).into_owned();
+    let mut fields = meta.split("__");
+    let status = fields
+        .next()
+        .unwrap_or("000")
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(0);
+    let content_type = fields.next().unwrap_or_default().to_string();
+    if status == 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "PROXY_FAILED",
+            "playback",
+            format!(
+                "curl exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            true,
+        ));
+    }
+    Ok((status, content_type, body))
+}
+
+async fn proxy_ass_subtitle(
+    state: &AppState,
+    session: &MediaSession,
+    url: Url,
+) -> ApiResult<Response> {
+    let response = state
+        .media_client
+        .get(url)
+        .headers(stream_headers(&session.stream)?)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "PROXY_FAILED",
+                "playback",
+                error.to_string(),
+                true,
+            )
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "PROXY_FAILED",
+                "playback",
+                error.to_string(),
+                true,
+            )
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > 4 * 1024 * 1024)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "INVALID_SUBTITLE",
+            "playback",
+            "The subtitle track is too large.",
+            false,
+        ));
+    }
+    let bytes = response.bytes().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "PROXY_FAILED",
+            "playback",
+            error.to_string(),
+            true,
+        )
+    })?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "INVALID_SUBTITLE",
+            "playback",
+            "The subtitle track is too large.",
+            false,
+        ));
+    }
+    let ass = String::from_utf8(bytes.to_vec()).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "INVALID_SUBTITLE",
+            "playback",
+            "The subtitle track is not valid UTF-8.",
+            false,
+        )
+    })?;
+    let webvtt = ass_to_webvtt(&ass).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "INVALID_SUBTITLE",
+            "playback",
+            error.to_string(),
+            false,
+        )
+    })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/vtt; charset=utf-8")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(webvtt))
+        .map_err(|error| ApiError::internal("playback", error))
+}
+
+fn ass_to_webvtt(ass: &str) -> Result<String> {
+    let mut in_events = false;
+    let mut columns = Vec::new();
+    let mut cues = Vec::new();
+    for raw_line in ass.trim_start_matches('\u{feff}').lines() {
+        let line = raw_line.trim_end_matches('\r').trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_events = line.eq_ignore_ascii_case("[Events]");
+            continue;
+        }
+        if !in_events {
+            continue;
+        }
+        if let Some(format) = line.strip_prefix("Format:") {
+            columns = format
+                .split(',')
+                .map(|column| column.trim().to_ascii_lowercase())
+                .collect();
+            continue;
+        }
+        let Some(dialogue) = line.strip_prefix("Dialogue:") else {
+            continue;
+        };
+        if columns.is_empty() {
+            continue;
+        }
+        let values = dialogue
+            .splitn(columns.len(), ',')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if values.len() != columns.len() {
+            continue;
+        }
+        let value = |name: &str| {
+            columns
+                .iter()
+                .position(|column| column == name)
+                .and_then(|index| values.get(index).copied())
+        };
+        let (Some(start), Some(end), Some(text)) = (value("start"), value("end"), value("text"))
+        else {
+            continue;
+        };
+        let (Some(start), Some(end)) =
+            (ass_timestamp_to_webvtt(start), ass_timestamp_to_webvtt(end))
+        else {
+            continue;
+        };
+        let text = ass_text_to_webvtt(text);
+        if !text.trim().is_empty() {
+            cues.push(format!("{start} --> {end}\n{text}"));
+        }
+    }
+    anyhow::ensure!(
+        !cues.is_empty(),
+        "The ASS subtitle contained no usable dialogue cues."
+    );
+    Ok(format!("WEBVTT\n\n{}\n", cues.join("\n\n")))
+}
+
+fn ass_timestamp_to_webvtt(value: &str) -> Option<String> {
+    let mut parts = value.trim().split(':');
+    let hours = parts.next()?.parse::<u32>().ok()?;
+    let minutes = parts.next()?.parse::<u32>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() || minutes >= 60 || !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    let total_milliseconds =
+        ((hours * 3_600 + minutes * 60) as f64 * 1_000.0 + seconds * 1_000.0).round() as u64;
+    Some(format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        total_milliseconds / 3_600_000,
+        total_milliseconds / 60_000 % 60,
+        total_milliseconds / 1_000 % 60,
+        total_milliseconds % 1_000
+    ))
+}
+
+fn ass_text_to_webvtt(value: &str) -> String {
+    let mut plain = String::with_capacity(value.len());
+    let mut in_override = false;
+    for character in value.chars() {
+        match character {
+            '{' => in_override = true,
+            '}' if in_override => in_override = false,
+            _ if !in_override => plain.push(character),
+            _ => {}
+        }
+    }
+    plain
+        .replace("\\N", "\n")
+        .replace("\\n", "\n")
+        .replace("\\h", " ")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn rewrite_hls_manifest(
     session_id: &str,
-    secret: &[u8; 32],
+    session: &MediaSession,
     base: &Url,
     manifest: &str,
-    resources: &mut HashMap<String, MediaResource>,
 ) -> String {
     manifest
         .lines()
@@ -1320,16 +1765,22 @@ fn rewrite_hls_manifest(
             if !trimmed.starts_with('#') {
                 return base
                     .join(trimmed)
-                    .map(|url| registered_resource_url(session_id, secret, resources, &url))
+                    .map(|mut url| {
+                        if url.query().is_none() {
+                            url.set_query(base.query());
+                        }
+                        url
+                    })
+                    .map(|url| opaque_resource_url(session_id, session, url, false))
                     .unwrap_or_else(|_| line.to_string());
             }
             if let Some(uri) = quoted_attribute(trimmed, "URI") {
-                if let Ok(url) = base.join(&uri) {
+                if let Some(url) = join_preserving_query(base, &uri) {
                     return line.replacen(
                         &format!("URI=\"{uri}\""),
                         &format!(
                             "URI=\"{}\"",
-                            registered_resource_url(session_id, secret, resources, &url)
+                            opaque_resource_url(session_id, session, url, false)
                         ),
                         1,
                     );
@@ -1343,14 +1794,14 @@ fn rewrite_hls_manifest(
 
 fn rewrite_dash_manifest(
     session_id: &str,
-    secret: &[u8; 32],
+    session: &MediaSession,
     manifest_url: &Url,
     manifest: &str,
-    resources: &mut HashMap<String, MediaResource>,
 ) -> String {
     let mut output = String::with_capacity(manifest.len() + 128);
     let mut remaining = manifest;
     let mut found_base = false;
+    let mut resource_base = manifest_url.clone();
     while let Some(start) = remaining.find("<BaseURL") {
         let Some(open_end_relative) = remaining[start..].find('>') else {
             break;
@@ -1362,96 +1813,222 @@ fn rewrite_dash_manifest(
         let close = open_end + close_relative;
         output.push_str(&remaining[..open_end]);
         let original = remaining[open_end..close].trim();
-        let absolute = manifest_url
-            .join(original)
-            .unwrap_or_else(|_| manifest_url.clone());
-        output.push_str(&registered_dash_base(
-            session_id, secret, resources, &absolute,
-        ));
+        let absolute =
+            join_preserving_query(manifest_url, original).unwrap_or_else(|| manifest_url.clone());
+        if !found_base {
+            resource_base = absolute.clone();
+        }
+        output.push_str(&opaque_resource_url(session_id, session, absolute, true));
+        output.push('/');
         output.push_str("</BaseURL>");
         remaining = &remaining[close + "</BaseURL>".len()..];
         found_base = true;
     }
     output.push_str(remaining);
     if found_base {
-        return output;
-    }
-    if let Some(mpd_start) = output.find("<MPD") {
+        return rewrite_dash_resource_attributes(session_id, session, &resource_base, &output);
+    } else if let Some(mpd_start) = output.find("<MPD") {
         if let Some(relative_end) = output[mpd_start..].find('>') {
             let insert_at = mpd_start + relative_end + 1;
-            let parent = manifest_url
-                .join(".")
-                .unwrap_or_else(|_| manifest_url.clone());
+            let parent =
+                join_preserving_query(manifest_url, ".").unwrap_or_else(|| manifest_url.clone());
             output.insert_str(
                 insert_at,
                 &format!(
-                    "<BaseURL>{}</BaseURL>",
-                    registered_dash_base(session_id, secret, resources, &parent)
+                    "<BaseURL>{}/</BaseURL>",
+                    opaque_resource_url(session_id, session, parent, true)
                 ),
             );
         }
     }
+    rewrite_dash_resource_attributes(session_id, session, manifest_url, &output)
+}
+
+fn rewrite_dash_resource_attributes(
+    session_id: &str,
+    session: &MediaSession,
+    manifest_url: &Url,
+    manifest: &str,
+) -> String {
+    ["media", "initialization", "sourceURL", "index", "href"]
+        .into_iter()
+        .fold(manifest.to_string(), |manifest, attribute| {
+            rewrite_dash_resource_attribute(session_id, session, manifest_url, &manifest, attribute)
+        })
+}
+
+fn rewrite_dash_resource_attribute(
+    session_id: &str,
+    session: &MediaSession,
+    manifest_url: &Url,
+    manifest: &str,
+    attribute: &str,
+) -> String {
+    let marker = format!("{attribute}=\"");
+    let mut output = String::with_capacity(manifest.len());
+    let mut remaining = manifest;
+    while let Some(start) = remaining.find(&marker) {
+        let value_start = start + marker.len();
+        let Some(value_length) = remaining[value_start..].find('"') else {
+            break;
+        };
+        let value_end = value_start + value_length;
+        let value = &remaining[value_start..value_end];
+        output.push_str(&remaining[..value_start]);
+        output.push_str(
+            &opaque_dash_attribute_url(session_id, session, manifest_url, value)
+                .unwrap_or_else(|| value.to_string()),
+        );
+        remaining = &remaining[value_end..];
+    }
+    output.push_str(remaining);
     output
 }
 
-fn registered_dash_base(
+fn opaque_dash_attribute_url(
     session_id: &str,
-    secret: &[u8; 32],
-    resources: &mut HashMap<String, MediaResource>,
-    base: &Url,
-) -> String {
-    let token = register_media_resource(secret, resources, base);
-    format!("/api/media/{session_id}/dash/base/{token}/")
+    session: &MediaSession,
+    manifest_url: &Url,
+    value: &str,
+) -> Option<String> {
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.starts_with("urn:")
+        || value.starts_with("/api/media/")
+    {
+        return None;
+    }
+    let absolute = join_preserving_query(manifest_url, value)?;
+    let Some(template_start) = absolute.path().find('$') else {
+        return Some(opaque_resource_url(session_id, session, absolute, false));
+    };
+    let base_end = absolute.path()[..template_start]
+        .rfind('/')
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let template = absolute.path()[base_end..].to_string();
+    let mut base = absolute;
+    let base_path = base.path()[..base_end].to_owned();
+    base.set_path(&base_path);
+    Some(format!(
+        "{}/{}",
+        opaque_resource_url(session_id, session, base, true),
+        template
+    ))
 }
 
-fn registered_resource_url(
-    session_id: &str,
-    secret: &[u8; 32],
-    resources: &mut HashMap<String, MediaResource>,
-    url: &Url,
-) -> String {
-    let token = register_media_resource(secret, resources, url);
-    format!("/api/media/{session_id}/resource?token={token}")
+fn join_preserving_query(base: &Url, value: &str) -> Option<Url> {
+    let mut joined = base.join(value).ok()?;
+    if joined.query().is_none() {
+        joined.set_query(base.query());
+    }
+    Some(joined)
 }
 
-fn register_media_resource(
-    secret: &[u8; 32],
-    resources: &mut HashMap<String, MediaResource>,
-    url: &Url,
+fn opaque_resource_url(
+    session_id: &str,
+    session: &MediaSession,
+    url: Url,
+    allow_relative_paths: bool,
 ) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("fixed-size HMAC key");
-    mac.update(url.as_str().as_bytes());
-    let token = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    let now = Instant::now();
-    if resources.contains_key(&token) {
-        resources.insert(
-            token.clone(),
+    opaque_resource_url_with_transform(
+        session_id,
+        session,
+        url,
+        allow_relative_paths,
+        MediaTransform::None,
+    )
+}
+
+fn opaque_subtitle_url(
+    session_id: &str,
+    session: &MediaSession,
+    url: Url,
+    format: SubtitleFormat,
+) -> String {
+    let transform = if format == SubtitleFormat::Ass {
+        MediaTransform::AssToWebVtt
+    } else {
+        MediaTransform::None
+    };
+    opaque_resource_url_with_transform(session_id, session, url, false, transform)
+}
+
+fn opaque_resource_url_with_transform(
+    session_id: &str,
+    session: &MediaSession,
+    url: Url,
+    allow_relative_paths: bool,
+    transform: MediaTransform,
+) -> String {
+    let resource_id =
+        opaque_resource_id_with_transform(&session.secret, &url, allow_relative_paths, transform);
+    session
+        .resources
+        .lock()
+        .expect("media resource map lock poisoned")
+        .insert(
+            resource_id.clone(),
             MediaResource {
-                url: url.clone(),
-                inserted_at: now,
+                url,
+                allow_relative_paths,
+                transform,
             },
         );
-        return token;
+    format!("/api/media/{session_id}/resource/{resource_id}")
+}
+
+#[cfg(test)]
+fn opaque_resource_id(secret: &[u8; 32], url: &Url, allow_relative_paths: bool) -> String {
+    opaque_resource_id_with_transform(secret, url, allow_relative_paths, MediaTransform::None)
+}
+
+fn opaque_resource_id_with_transform(
+    secret: &[u8; 32],
+    url: &Url,
+    allow_relative_paths: bool,
+    transform: MediaTransform,
+) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("fixed-size HMAC key");
+    mac.update(&[u8::from(allow_relative_paths)]);
+    mac.update(&[match transform {
+        MediaTransform::None => 0,
+        MediaTransform::AssToWebVtt => 1,
+    }]);
+    mac.update(url.as_str().as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn resolve_opaque_resource(
+    session: &MediaSession,
+    resource_id: &str,
+    relative_path: Option<&str>,
+) -> ApiResult<Url> {
+    let resource = resolve_media_resource(session, resource_id)?;
+    match relative_path {
+        Some(path)
+            if resource.allow_relative_paths && resource.transform == MediaTransform::None =>
+        {
+            resolve_dash_upstream(resource.url, path)
+        }
+        Some(_) => Err(invalid_media_resource()),
+        None => Ok(resource.url),
     }
-    resources.retain(|_, resource| now.duration_since(resource.inserted_at) < MEDIA_RESOURCE_TTL);
-    while resources.len() >= MAX_MEDIA_RESOURCES {
-        let Some(oldest) = resources
-            .iter()
-            .min_by_key(|(_, resource)| resource.inserted_at)
-            .map(|(token, _)| token.clone())
-        else {
-            break;
-        };
-        resources.remove(&oldest);
-    }
-    resources.insert(
-        token.clone(),
-        MediaResource {
-            url: url.clone(),
-            inserted_at: now,
-        },
-    );
-    token
+}
+
+fn resolve_media_resource(session: &MediaSession, resource_id: &str) -> ApiResult<MediaResource> {
+    session
+        .resources
+        .lock()
+        .expect("media resource map lock poisoned")
+        .get(resource_id)
+        .cloned()
+        .ok_or_else(invalid_media_resource)
 }
 
 async fn my_list(
@@ -1683,12 +2260,32 @@ async fn proxy_download_response(
     let file_name = browser_download_file_name(request, &stream);
 
     let body = if is_hls {
-        let segments = resolve_hls_segments(client, &upstream_headers, source).await?;
-        Body::from_stream(hls_body_stream(
-            client.clone(),
-            upstream_headers.clone(),
-            segments,
-        ))
+        let segments = if stream.use_curl {
+            resolve_hls_segments_via_curl(&stream.headers, source).await?
+        } else {
+            resolve_hls_segments(client, &upstream_headers, source).await?
+        };
+        if stream.use_curl {
+            Body::from_stream(hls_body_stream_via_curl(stream.headers.clone(), segments))
+        } else {
+            Body::from_stream(hls_body_stream(
+                client.clone(),
+                upstream_headers.clone(),
+                segments,
+            ))
+        }
+    } else if stream.use_curl {
+        let (status, _, body) = curl_fetch(&source, &stream.headers, None, 900).await?;
+        if status != 200 {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "DOWNLOAD_FAILED",
+                "download",
+                format!("upstream returned HTTP {status}"),
+                true,
+            ));
+        }
+        Body::from(body)
     } else {
         let response = client
             .get(source)
@@ -1751,6 +2348,44 @@ async fn resolve_hls_segments(
     } else {
         fetch_text(client, headers, media_url.clone()).await?
     };
+    parse_hls_segments(&media_url, &media)
+}
+
+async fn resolve_hls_segments_via_curl(
+    headers: &std::collections::HashMap<String, String>,
+    source: Url,
+) -> ApiResult<Vec<Url>> {
+    let (status, _, master) = curl_fetch(&source, headers, None, 900).await?;
+    if status != 200 {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "DOWNLOAD_FAILED",
+            "download",
+            format!("upstream returned HTTP {status}"),
+            true,
+        ));
+    }
+    let master = String::from_utf8_lossy(&master).into_owned();
+    let media_url = highest_bandwidth_variant(&source, &master).unwrap_or(source.clone());
+    let media = if media_url == source {
+        master
+    } else {
+        let (status, _, body) = curl_fetch(&media_url, headers, None, 900).await?;
+        if status != 200 {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "DOWNLOAD_FAILED",
+                "download",
+                format!("upstream returned HTTP {status}"),
+                true,
+            ));
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    parse_hls_segments(&media_url, &media)
+}
+
+fn parse_hls_segments(media_url: &Url, media: &str) -> ApiResult<Vec<Url>> {
     if media.lines().any(|line| {
         let line = line.trim().to_ascii_uppercase();
         line.starts_with("#EXT-X-KEY") && !line.contains("METHOD=NONE")
@@ -1815,6 +2450,25 @@ fn hls_body_stream(
             while let Some(chunk) = response.chunk().await.map_err(std::io::Error::other)? {
                 yield chunk;
             }
+        }
+    }
+}
+
+fn hls_body_stream_via_curl(
+    headers: std::collections::HashMap<String, String>,
+    segments: Vec<Url>,
+) -> impl futures_util::Stream<Item = std::result::Result<Bytes, std::io::Error>> {
+    async_stream::try_stream! {
+        for segment in segments {
+            let (status, _, body) = curl_fetch(&segment, &headers, None, 900)
+                .await
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            if status != 200 {
+                Err(std::io::Error::other(format!(
+                    "upstream returned HTTP {status}"
+                )))?;
+            }
+            yield Bytes::from(body);
         }
     }
 }
@@ -2148,27 +2802,6 @@ fn map_anime(anime: Anime, catalog_id: Option<i64>) -> AnimeDto {
     }
 }
 
-fn normalize_title(value: &str) -> String {
-    value
-        .chars()
-        .filter(|value| value.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-fn best_title_match(items: Vec<Anime>, title: &str) -> Option<Anime> {
-    let target = normalize_title(title);
-    items.into_iter().min_by_key(|anime| {
-        let value = normalize_title(&anime.title);
-        if value == target {
-            0
-        } else if value.contains(&target) || target.contains(&value) {
-            1
-        } else {
-            2
-        }
-    })
-}
-
 fn classify_provider_error(value: &str) -> &'static str {
     let lower = value.to_ascii_lowercase();
     if lower.contains("captcha") || lower.contains("cloudflare") {
@@ -2190,6 +2823,75 @@ fn non_empty(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    const UPSTREAM_HOST: &str = "private-cdn.example";
+    const SIGNED_VALUE: &str = "signed-query-secret";
+    const COOKIE_VALUE: &str = "upstream_session=private-cookie";
+    const REQUIRED_HEADER_VALUE: &str = "required-header-secret";
+
+    fn media_session(video_url: &str) -> MediaSession {
+        let mut stream = stream(video_url);
+        stream.subtitles.push(ani_desk_core::providers::Subtitle {
+            language: "English".into(),
+            url: format!("https://{UPSTREAM_HOST}/subtitles/en.vtt?token={SIGNED_VALUE}"),
+            format: SubtitleFormat::WebVtt,
+        });
+        stream.headers.insert("Cookie".into(), COOKIE_VALUE.into());
+        stream
+            .headers
+            .insert("X-Required-Auth".into(), REQUIRED_HEADER_VALUE.into());
+        MediaSession {
+            user_id: "user".into(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            stream,
+            secret: [7_u8; 32],
+            resources: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    fn assert_private_material_absent(value: &str, urls: &[&str]) {
+        assert!(
+            !value.contains(UPSTREAM_HOST),
+            "upstream hostname leaked: {value}"
+        );
+        assert!(
+            !value.contains(SIGNED_VALUE),
+            "signed value leaked: {value}"
+        );
+        assert!(!value.contains(COOKIE_VALUE), "cookie leaked: {value}");
+        assert!(
+            !value.contains(REQUIRED_HEADER_VALUE),
+            "required header leaked: {value}"
+        );
+        for url in urls {
+            let percent_encoded =
+                url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>();
+            let base64 = base64::engine::general_purpose::STANDARD.encode(url);
+            let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url);
+            assert!(!value.contains(url), "upstream URL leaked: {value}");
+            assert!(
+                !value.contains(&percent_encoded),
+                "percent-encoded upstream URL leaked: {value}"
+            );
+            assert!(
+                !value.contains(&base64),
+                "base64 upstream URL leaked: {value}"
+            );
+            assert!(
+                !value.contains(&url_safe),
+                "URL-safe base64 upstream URL leaked: {value}"
+            );
+        }
+    }
+
+    fn resource_id(resource_url: &str) -> &str {
+        resource_url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap()
+    }
 
     fn download_request() -> BrowserDownloadInput {
         BrowserDownloadInput {
@@ -2210,6 +2912,7 @@ mod tests {
             subtitles: Vec::new(),
             qualities: Vec::new(),
             headers: HashMap::new(),
+            use_curl: false,
         }
     }
 
@@ -2238,92 +2941,169 @@ mod tests {
     }
 
     #[test]
-    fn dash_rewrite_signs_existing_and_default_base_urls() {
-        let manifest_url = Url::parse("https://cdn.example/show/manifest.mpd").unwrap();
-        let secret = [7_u8; 32];
-        let mut resources = HashMap::new();
-        let with_base = rewrite_dash_manifest(
-            "session",
-            &secret,
-            &manifest_url,
-            "<MPD><Period><BaseURL>video/</BaseURL></Period></MPD>",
-            &mut resources,
-        );
-        assert!(with_base.contains("/api/media/session/dash/base/"));
-        assert!(!with_base.contains(">video/</BaseURL>"));
-        assert!(!with_base.contains("cdn.example"));
+    fn playback_json_exposes_only_opaque_same_origin_resources() {
+        let video_url = format!("https://{UPSTREAM_HOST}/show/master.m3u8?token={SIGNED_VALUE}");
+        let subtitle_url = format!("https://{UPSTREAM_HOST}/subtitles/en.vtt?token={SIGNED_VALUE}");
+        let session = media_session(&video_url);
+        let json = serde_json::to_string(&playback_dto("session", &session)).unwrap();
 
-        let without_base = rewrite_dash_manifest(
-            "session",
-            &secret,
-            &manifest_url,
-            "<MPD><Period /></MPD>",
-            &mut resources,
-        );
-        assert!(without_base.starts_with("<MPD><BaseURL>/api/media/session/dash/base/"));
-        assert!(resources
-            .values()
-            .any(|resource| resource.url.host_str() == Some("cdn.example")));
-    }
-
-    #[test]
-    fn hls_rewrite_uses_opaque_resource_tokens() {
-        let manifest_url =
-            Url::parse("https://cdn.example/show/master.m3u8?secret=upstream").unwrap();
-        let secret = [9_u8; 32];
-        let mut resources = HashMap::new();
-        let rewritten = rewrite_hls_manifest(
-            "session",
-            &secret,
-            &manifest_url,
-            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin?token=hidden\"\nsegment.ts?token=hidden",
-            &mut resources,
-        );
-
-        assert!(rewritten.contains("/api/media/session/resource?token="));
-        assert!(!rewritten.contains("cdn.example"));
-        assert!(!rewritten.contains("token=hidden"));
-        assert_eq!(resources.len(), 2);
-    }
-
-    #[test]
-    fn dash_resources_must_remain_on_the_signed_origin() {
-        let base = Url::parse("https://cdn.example/show/manifest.mpd").unwrap();
+        assert_private_material_absent(&json, &[&video_url, &subtitle_url]);
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let resource_url = value["subtitles"][0]["url"].as_str().unwrap();
+        assert!(resource_url.starts_with("/api/media/session/resource/"));
+        assert!(!resource_url.contains('?'));
+        assert_eq!(resource_id(resource_url).len(), 64);
+        assert!(resource_id(resource_url)
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
-            resolve_dash_upstream(base.clone(), "segments/1.m4s")
+            resource_id(resource_url),
+            opaque_resource_id(&[7_u8; 32], &Url::parse(&subtitle_url).unwrap(), false)
+        );
+        assert_eq!(
+            resolve_opaque_resource(&session, resource_id(resource_url), None)
                 .unwrap()
                 .as_str(),
-            "https://cdn.example/show/segments/1.m4s"
+            subtitle_url
         );
-        assert!(resolve_dash_upstream(base, "https://attacker.example/1.m4s").is_err());
     }
 
     #[test]
-    fn dash_resources_preserve_signed_query_parameters() {
-        let base = Url::parse("https://cdn.example/show/manifest.mpd?manifest=1").unwrap();
-        let mut upstream = resolve_dash_upstream(base, "segments/1.m4s?segment=2").unwrap();
-        append_upstream_query(&mut upstream, Some("token=signed&expires=123"));
+    fn hls_rewrite_hides_private_material_and_resolves_opaque_resources() {
+        let manifest_url = Url::parse(&format!(
+            "https://{UPSTREAM_HOST}/show/master.m3u8?token={SIGNED_VALUE}"
+        ))
+        .unwrap();
+        let absolute_segment =
+            format!("https://{UPSTREAM_HOST}/show/absolute.ts?token={SIGNED_VALUE}");
+        let session = media_session(manifest_url.as_str());
+        let manifest = format!(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.bin\"\nsegment.ts\n{absolute_segment}"
+        );
+        let rewritten = rewrite_hls_manifest("session", &session, &manifest_url, &manifest);
+
+        assert_private_material_absent(&rewritten, &[manifest_url.as_str(), &absolute_segment]);
+        let resource_urls = rewritten
+            .split(['\n', '"'])
+            .filter(|value| value.starts_with("/api/media/session/resource/"))
+            .collect::<Vec<_>>();
+        assert_eq!(resource_urls.len(), 3);
+        assert!(resource_urls.iter().all(|url| !url.contains('?')));
         assert_eq!(
-            upstream.as_str(),
-            "https://cdn.example/show/segments/1.m4s?segment=2&token=signed&expires=123"
+            resolve_opaque_resource(&session, resource_id(resource_urls[1]), None)
+                .unwrap()
+                .as_str(),
+            format!("https://{UPSTREAM_HOST}/show/segment.ts?token={SIGNED_VALUE}")
         );
     }
 
     #[test]
-    fn media_resource_registry_evicts_the_oldest_entry_at_capacity() {
-        let secret = [4_u8; 32];
-        let mut resources = HashMap::new();
-        for index in 0..=MAX_MEDIA_RESOURCES {
-            let url = Url::parse(&format!("https://cdn.example/{index}.ts")).unwrap();
-            register_media_resource(&secret, &mut resources, &url);
-        }
-        assert_eq!(resources.len(), MAX_MEDIA_RESOURCES);
-        assert!(!resources
-            .values()
-            .any(|resource| resource.url.path() == "/0.ts"));
-        assert!(resources
-            .values()
-            .any(|resource| resource.url.path() == format!("/{MAX_MEDIA_RESOURCES}.ts")));
+    fn dash_rewrite_hides_private_material_and_resolves_opaque_paths() {
+        let manifest_url = Url::parse(&format!(
+            "https://{UPSTREAM_HOST}/show/manifest.mpd?token={SIGNED_VALUE}"
+        ))
+        .unwrap();
+        let upstream_base = format!("https://{UPSTREAM_HOST}/show/video/?token={SIGNED_VALUE}");
+        let session = media_session(manifest_url.as_str());
+        let with_base = rewrite_dash_manifest(
+            "session",
+            &session,
+            &manifest_url,
+            &format!(
+                "<MPD><Period><BaseURL>{upstream_base}</BaseURL><SegmentTemplate media=\"https://{UPSTREAM_HOST}/show/chunks/$Number$.m4s?token={SIGNED_VALUE}\" initialization=\"init.mp4\" /></Period></MPD>"
+            ),
+        );
+        assert_private_material_absent(&with_base, &[manifest_url.as_str(), &upstream_base]);
+        assert!(with_base.contains("<BaseURL>/api/media/session/resource/"));
+        assert!(!with_base.contains('?'));
+        assert!(with_base.contains("media=\"/api/media/session/resource/"));
+        assert!(with_base.contains("/$Number$.m4s\""));
+        assert!(with_base.contains("initialization=\"/api/media/session/resource/"));
+        let media_url = quoted_attribute(&with_base, "media").unwrap();
+        let (media_base, _) = media_url.rsplit_once('/').unwrap();
+        assert_eq!(
+            resolve_opaque_resource(&session, resource_id(media_base), Some("1.m4s"))
+                .unwrap()
+                .as_str(),
+            format!("https://{UPSTREAM_HOST}/show/chunks/1.m4s?token={SIGNED_VALUE}")
+        );
+        let base_url = with_base
+            .split("<BaseURL>")
+            .nth(1)
+            .unwrap()
+            .split("</BaseURL>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            resolve_opaque_resource(&session, resource_id(base_url), Some("segments/1.m4s"))
+                .unwrap()
+                .as_str(),
+            format!("https://{UPSTREAM_HOST}/show/video/segments/1.m4s?token={SIGNED_VALUE}")
+        );
+
+        let without_base =
+            rewrite_dash_manifest("session", &session, &manifest_url, "<MPD><Period /></MPD>");
+        assert_private_material_absent(&without_base, &[manifest_url.as_str()]);
+        assert!(without_base.starts_with("<MPD><BaseURL>/api/media/session/resource/"));
+    }
+
+    #[test]
+    fn opaque_resources_reject_unknown_ids_and_cross_origin_paths() {
+        let base = Url::parse(&format!(
+            "https://{UPSTREAM_HOST}/show/?token={SIGNED_VALUE}"
+        ))
+        .unwrap();
+        let session = media_session(base.as_str());
+        let resource_url = opaque_resource_url("session", &session, base, true);
+
+        assert!(resolve_opaque_resource(&session, "0", None).is_err());
+        assert!(resolve_opaque_resource(
+            &session,
+            resource_id(&resource_url),
+            Some("https://attacker.example/1.m4s")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn opaque_proxy_resources_retain_required_upstream_headers() {
+        let session = media_session(&format!(
+            "https://{UPSTREAM_HOST}/show/master.m3u8?token={SIGNED_VALUE}"
+        ));
+        let headers = stream_headers(&session.stream).unwrap();
+
+        assert_eq!(headers.get(reqwest::header::COOKIE).unwrap(), COOKIE_VALUE);
+        assert_eq!(
+            headers.get("x-required-auth").unwrap(),
+            REQUIRED_HEADER_VALUE
+        );
+    }
+
+    #[test]
+    fn converts_ass_dialogue_to_browser_native_webvtt() {
+        let ass = "\u{feff}[Script Info]\r\nTitle: Test\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:01:02.34,0:01:05.60,Default,,0,0,0,,{\\an8}Hello, world!\\NSecond <line>\r\nComment: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Ignored\r\n";
+        let output = ass_to_webvtt(ass).unwrap();
+
+        assert_eq!(
+            output,
+            "WEBVTT\n\n00:01:02.340 --> 00:01:05.600\nHello, world!\nSecond &lt;line&gt;\n"
+        );
+    }
+
+    #[test]
+    fn transformed_subtitles_use_distinct_opaque_resources() {
+        let session = media_session("https://cdn.example/master.m3u8");
+        let url = Url::parse("https://cdn.example/subtitle.ass").unwrap();
+        let raw = opaque_resource_url("session", &session, url.clone(), false);
+        let converted = opaque_subtitle_url("session", &session, url, SubtitleFormat::Ass);
+
+        assert_ne!(resource_id(&raw), resource_id(&converted));
+        assert_eq!(
+            resolve_media_resource(&session, resource_id(&converted))
+                .unwrap()
+                .transform,
+            MediaTransform::AssToWebVtt
+        );
     }
 
     #[test]

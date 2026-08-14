@@ -1,4 +1,4 @@
-use super::{Anime, AnimeProvider, Episode, Language, StreamInfo, Subtitle};
+use super::{Anime, AnimeProvider, Episode, Language, ProviderCapabilities, StreamInfo};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{self, HeaderMap};
@@ -54,32 +54,6 @@ impl KkphimProvider {
             ))
         }
     }
-
-    fn plain_text(value: &str) -> Option<String> {
-        let mut text = String::with_capacity(value.len());
-        let mut inside_tag = false;
-        for character in value.chars() {
-            match character {
-                '<' => inside_tag = true,
-                '>' => {
-                    inside_tag = false;
-                    text.push(' ');
-                }
-                _ if !inside_tag => text.push(character),
-                _ => {}
-            }
-        }
-
-        let decoded = text
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">");
-        let normalized = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!normalized.is_empty()).then_some(normalized)
-    }
 }
 
 #[async_trait]
@@ -98,6 +72,13 @@ impl AnimeProvider for KkphimProvider {
 
     fn website_url(&self) -> Option<&'static str> {
         Some("https://www.kkphim.com")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            subtitles: false,
+            ..ProviderCapabilities::default()
+        }
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Anime>> {
@@ -160,7 +141,7 @@ impl AnimeProvider for KkphimProvider {
                             banner_url: None,
                             language: Language::Vietnamese,
                             total_episodes: episode_count,
-                            synopsis: item["content"].as_str().and_then(Self::plain_text),
+                            synopsis: item["content"].as_str().map(|s| s.to_string()),
                         });
                     }
                 }
@@ -216,7 +197,7 @@ impl AnimeProvider for KkphimProvider {
             banner_url,
             language: Language::Vietnamese,
             total_episodes,
-            synopsis: item["content"].as_str().and_then(Self::plain_text),
+            synopsis: item["content"].as_str().map(|s| s.to_string()),
         }))
     }
 
@@ -290,6 +271,9 @@ impl AnimeProvider for KkphimProvider {
                                     episodes.push(Episode {
                                         id: format!("{}:{}", anime_id, ep_number),
                                         number: ep_number,
+                                        aniskip_episode_number: super::aniskip_episode_number(
+                                            name_str,
+                                        ),
                                         title: Some(format!("Episode {}", ep_number)),
                                         thumbnail: None,
                                     });
@@ -359,7 +343,7 @@ impl AnimeProvider for KkphimProvider {
         );
 
         let mut stream_url = String::new();
-        let mut subtitles: Vec<Subtitle> = Vec::new();
+        let subtitles = Vec::new();
         let qualities = vec!["auto".to_string()];
         let mut headers: HashMap<String, String> = HashMap::new();
 
@@ -448,12 +432,6 @@ impl AnimeProvider for KkphimProvider {
                                         tracing::warn!("No stream URL found in server_ep");
                                     }
 
-                                    // KKPhim provides Vietnamese hardcoded subtitles in the video
-                                    subtitles.push(Subtitle {
-                                        language: "vi".to_string(),
-                                        url: String::new(),
-                                    });
-
                                     break 'outer;
                                 }
                             }
@@ -487,22 +465,7 @@ impl AnimeProvider for KkphimProvider {
             subtitles,
             qualities,
             headers,
+            use_curl: false,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::KkphimProvider;
-
-    #[test]
-    fn synopsis_is_plain_normalized_text() {
-        assert_eq!(
-            KkphimProvider::plain_text(
-                "<p>Khi một cậu bé&nbsp;mất tích, <strong>gia đình</strong> tìm kiếm &amp; chờ đợi.</p>",
-            ),
-            Some("Khi một cậu bé mất tích, gia đình tìm kiếm & chờ đợi.".to_string())
-        );
-        assert_eq!(KkphimProvider::plain_text("<p> </p>"), None);
     }
 }

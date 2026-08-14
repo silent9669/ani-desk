@@ -1,28 +1,36 @@
+import json
 import os
 import time
 import socket
 import subprocess
-import json
 from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import sync_playwright
 
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
 @pytest.fixture(scope="session")
 def vite_server():
-    # Start the Vite server
+    # Start the Vite server on a free port so concurrent sessions and CI
+    # runners never collide on a fixed port.
+    port = _free_port()
     proc = subprocess.Popen(
-        ["npm", "run", "dev"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
+        ["npm", "run", "dev", "--", "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
-    # Wait for the port to be open
+    # Wait until our process serves the port; fail fast if it exited
+    # (for example when the port was already taken by another server).
     start_time = time.time()
-    port = 1420
     host = "127.0.0.1"
     server_ready = False
     while time.time() - start_time < 15:
+        if proc.poll() is not None:
+            break
         try:
             with socket.create_connection((host, port), timeout=1):
                 server_ready = True
@@ -32,38 +40,28 @@ def vite_server():
 
     if not server_ready:
         proc.kill()
-        raise RuntimeError("Vite dev server failed to start on port 1420")
+        raise RuntimeError(f"Vite dev server failed to start on port {port}")
 
-    yield proc
+    yield proc, port
 
     proc.terminate()
     proc.wait()
 
 @pytest.fixture(scope="function")
 def mocked_page(page, vite_server):
-    # Intercept and mock window.__TAURI_INTERNALS__.invoke and window.__tauri_ipc__ before page loads
+    vite_proc, vite_port = vite_server
+    # Mock the browser API before the application loads.
     page.add_init_script("""
-        window.__TAURI_INTERNALS__ = window.__TAURI_INTERNALS__ || {};
-        window.__TAURI_CALLS__ = window.__TAURI_CALLS__ || [];
-        window.__TAURI_CALLBACKS__ = window.__TAURI_CALLBACKS__ || {};
-        window.__TAURI_CALLBACK_ID__ = window.__TAURI_CALLBACK_ID__ || 1;
-        window.__TAURI_INTERNALS__.transformCallback = window.__TAURI_INTERNALS__.transformCallback || ((callback) => {
-            const id = window.__TAURI_CALLBACK_ID__++;
-            window.__TAURI_CALLBACKS__[id] = callback;
-            return id;
-        });
-        window.__TAURI_INTERNALS__.unregisterCallback = window.__TAURI_INTERNALS__.unregisterCallback || ((id) => {
-            delete window.__TAURI_CALLBACKS__[id];
-        });
+        window.__API_CALLS__ = window.__API_CALLS__ || [];
 
         const getMockState = () => {
             const defaults = {
                 sources: [
+                    { name: "AniZone", language: "English", languageGroup: "english", status: "healthy", failureCode: null, websiteUrl: "https://anizone.to", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: true } },
                     { name: "AllAnime", language: "English", languageGroup: "english", status: "healthy", failureCode: null, websiteUrl: null, verificationUrl: "https://api.allanime.day/api", capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: true } },
                     { name: "AnimeGG", language: "English", languageGroup: "english", status: "healthy", failureCode: null, websiteUrl: "https://www.animegg.org", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: false } },
-                    { name: "MovieBox", language: "English", languageGroup: "english", status: "healthy", failureCode: null, websiteUrl: "https://moviebox.ph", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: true } },
-                    { name: "KKPhim", language: "Vietnamese", languageGroup: "vietnamese", status: "healthy", failureCode: null, websiteUrl: "https://www.kkphim.com", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: true } },
-                    { name: "OPhim", language: "Vietnamese", languageGroup: "vietnamese", status: "healthy", failureCode: null, websiteUrl: "https://ophim19.cc", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: true } }
+                    { name: "KKPhim", language: "Vietnamese", languageGroup: "vietnamese", status: "healthy", failureCode: null, websiteUrl: "https://www.kkphim.com", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: false } },
+                    { name: "OPhim", language: "Vietnamese", languageGroup: "vietnamese", status: "healthy", failureCode: null, websiteUrl: "https://ophim19.cc", verificationUrl: null, capabilities: { search: true, details: true, episodes: true, playback: true, subtitles: false } }
                 ],
                 my_list: [
                     {
@@ -91,6 +89,9 @@ def mocked_page(page, vite_server):
                 search_error: null,
                 catalog_search_error: null,
                 provider_search_error: null,
+                provider_health_error: null,
+                episode_provider: null,
+                skip_times: null,
                 playback_error: null,
                 download_error: null,
                 downloads: [],
@@ -99,7 +100,7 @@ def mocked_page(page, vite_server):
                 update_install_error: null,
                 episode_count: 1200
             };
-            const stored = localStorage.getItem('__TAURI_MOCK_STATE__');
+            const stored = localStorage.getItem('__API_MOCK_STATE__');
             if (stored) {
                 try {
                     return { ...defaults, ...JSON.parse(stored) };
@@ -109,34 +110,28 @@ def mocked_page(page, vite_server):
         };
 
         const saveMockState = (state) => {
-            localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+            localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
         };
 
-        window.__TAURI_MOCK_STATE__ = getMockState();
+        window.__API_MOCK_STATE__ = getMockState();
 
-        window.__TAURI_INTERNALS__.invoke = async function(cmd, args) {
-            console.log("Mocked Invoke called:", cmd, args);
-            window.__TAURI_CALLS__.push({ cmd, args });
+        const invokeMock = async function(cmd, args = {}) {
+            window.__API_CALLS__.push({ cmd, args });
 
             const state = getMockState();
 
             if (cmd === "list_sources") {
                 return state.sources;
+            } else if (cmd === "list_provider_health" && state.provider_health_error) {
+                throw state.provider_health_error;
             } else if (cmd === "list_provider_health" || cmd === "retry_provider_health") {
-                return state.sources;
-            } else if (cmd === "open_provider_access") {
-                return null;
-            } else if (cmd === "complete_provider_verification") {
-                state.sources = state.sources.map((source) => source.name === args.provider
-                    ? { ...source, status: "healthy", failureCode: null }
-                    : source);
-                saveMockState(state);
                 return state.sources;
             } else if (cmd === "get_discovery") {
                 const makeCatalog = (index) => ({
                     catalogId: 1000 + index,
                     title: index === 0 ? "One Piece" : `Catalog Anime ${index + 1}`,
                     nativeTitle: null,
+                    synonyms: index === 0 ? ["Đảo Hải Tặc"] : [],
                     description: `Catalog synopsis ${index + 1}.`,
                     coverUrl: `https://example.com/catalog-${index + 1}.jpg`,
                     bannerUrl: `https://example.com/catalog-banner-${index + 1}.jpg`,
@@ -157,6 +152,7 @@ def mocked_page(page, vite_server):
                     catalogId: 2000 + index,
                     title: `${args.genre} Anime ${index + 1}`,
                     nativeTitle: null,
+                    synonyms: [],
                     description: `${args.genre} catalog title.`,
                     coverUrl: `https://example.com/genre-${index + 1}.jpg`,
                     bannerUrl: null,
@@ -175,6 +171,7 @@ def mocked_page(page, vite_server):
                         catalogId: page * 10000 + index,
                         title: `${args.filters.genre || "Trending"} Anime ${index + 1}`,
                         nativeTitle: null,
+                        synonyms: [],
                         description: "Catalog browser synopsis.",
                         coverUrl: `https://example.com/browser-${index + 1}.jpg`,
                         bannerUrl: null,
@@ -192,10 +189,12 @@ def mocked_page(page, vite_server):
                 if (state.search_error) throw state.search_error;
                 if ((args.query || "").toLowerCase().includes("empty")) return [];
                 if ((args.query || "").toLowerCase().includes("cinema")) return [];
+                const onePiece = (args.query || "").toLowerCase().includes("one piece");
                 return Array.from({ length: 16 }, (_, index) => ({
-                    catalogId: 3000 + index,
-                    title: index === 0 ? "Naruto Shippuden" : `Sample Anime ${index + 1}`,
+                    catalogId: index === 0 && onePiece ? 21 : 3000 + index,
+                    title: index === 0 ? (onePiece ? "One Piece" : "Naruto Shippuden") : `Sample Anime ${index + 1}`,
                     nativeTitle: null,
+                    synonyms: index === 0 ? (onePiece ? [] : ["Naruto: Shippuden"]) : [],
                     description: index === 0 ? "A story about Naruto." : `Sample synopsis ${index + 1}.`,
                     coverUrl: `https://example.com/search-${index + 1}.jpg`,
                     bannerUrl: `https://example.com/search-banner-${index + 1}.jpg`,
@@ -295,12 +294,25 @@ def mocked_page(page, vite_server):
                             title: "Cinema Film",
                             coverUrl: "https://example.com/cinema-film.jpg",
                             bannerUrl: "https://example.com/cinema-banner.jpg",
-                            language: args.source === "AllAnime" ? "English" : "Vietnamese",
+                            language: ["AniZone", "AllAnime"].includes(args.source) ? "English" : "Vietnamese",
                             totalEpisodes: 1,
                             synopsis: "A provider-only film result.",
                             isFavorite: false
                         }
                     ];
+                }
+                if (query.toLowerCase().includes("one piece") && ["KKPhim", "OPhim", "Niniyo"].includes(args.source)) {
+                    return [{
+                        id: "dao-hai-tac",
+                        provider: args.source,
+                        title: "Đảo Hải Tặc",
+                        coverUrl: "https://example.com/one-piece.jpg",
+                        bannerUrl: "https://example.com/one-piece-banner.jpg",
+                        language: "Vietnamese",
+                        totalEpisodes: 1173,
+                        synopsis: "A pirate adventure.",
+                        isFavorite: false
+                    }];
                 }
                 const baseResults = [
                     {
@@ -309,7 +321,7 @@ def mocked_page(page, vite_server):
                         title: "Naruto Shippuden",
                         coverUrl: "https://example.com/naruto-shippuden.jpg",
                         bannerUrl: "https://example.com/naruto-banner.jpg",
-                        language: args.source === "AllAnime" ? "English" : "Vietnamese",
+                        language: ["AniZone", "AllAnime"].includes(args.source) ? "English" : "Vietnamese",
                         totalEpisodes: 1200,
                         synopsis: "A story about Naruto.",
                         isFavorite: false
@@ -320,7 +332,7 @@ def mocked_page(page, vite_server):
                         title: "Demon Slayer",
                         coverUrl: "https://example.com/demon-slayer.jpg",
                         bannerUrl: "https://example.com/demon-banner.jpg",
-                        language: args.source === "AllAnime" ? "English" : "Vietnamese",
+                        language: ["AniZone", "AllAnime"].includes(args.source) ? "English" : "Vietnamese",
                         totalEpisodes: 26,
                         synopsis: "A story about Tanjiro.",
                         isFavorite: false
@@ -332,7 +344,7 @@ def mocked_page(page, vite_server):
                     title: `Sample Anime ${index + 1}`,
                     coverUrl: `https://example.com/sample-${index + 1}.jpg`,
                     bannerUrl: `https://example.com/sample-banner-${index + 1}.jpg`,
-                    language: args.source === "AllAnime" ? "English" : "Vietnamese",
+                    language: ["AniZone", "AllAnime"].includes(args.source) ? "English" : "Vietnamese",
                     totalEpisodes: 12 + index,
                     synopsis: `Sample synopsis ${index + 1}.`,
                     isFavorite: false
@@ -341,17 +353,20 @@ def mocked_page(page, vite_server):
                 return {
                     coverUrl: "https://example.com/details.jpg",
                     bannerUrl: "https://example.com/banner.jpg",
-                    totalEpisodes: state.episode_count ?? 1200,
+                    totalEpisodes: state.episode_count || 1200,
                     synopsis: "Detailed synopsis of the selected anime."
                 };
             } else if (cmd === "get_episodes") {
                 const eps = [];
-                const total = state.episode_count ?? 1200;
+                const total = state.episode_count || 1200;
+                const provider = state.episode_provider || args.provider || state.sources?.find((source) => source.status === "healthy")?.name || "AniZone";
+                const certified = ["AniZone", "AniDB", "KKPhim", "OPhim", "Niniyo"].includes(provider);
                 for (let i = 1; i <= total; i++) {
                     eps.push({
                         id: `ep-${i}`,
                         number: i,
                         title: `Episode ${i}`,
+                        aniskipEpisodeNumber: certified ? i : null,
                         thumbnail: `https://example.com/ep-${i}.jpg`
                     });
                 }
@@ -363,22 +378,24 @@ def mocked_page(page, vite_server):
                 return {
                     sessionId: "session-123",
                     playbackUrl: "https://example.com/stream.m3u8",
-                    originalUrl: "https://example.com/original",
+                    originalUrl: "https://example.com/stream.m3u8",
                     streamKind: "hls",
-                    subtitles: [],
+                    subtitles: args.provider === "AniZone"
+                        ? [{ language: "English", url: "data:text/vtt,WEBVTT%0A%0A00%3A00%3A00.000%20--%3E%2000%3A00%3A05.000%0AEnglish%20subtitle" }]
+                        : [],
                     qualities: ["360p", "720p", "1080p"],
                     canFallbackToMpv: true
                 };
+            } else if (cmd === "get_skip_times") {
+                return state.skip_times || [
+                    { skipType: "op", startTime: 90, endTime: 150, episodeLength: 1420 },
+                    { skipType: "ed", startTime: 1320, endTime: 1410, episodeLength: 1420 }
+                ];
             } else if (cmd === "download_episode") {
                 if (state.download_error) {
                     throw new Error(state.download_error);
                 }
                 const fileName = `Episode ${String(args.request.episodeNumber).padStart(2, "0")}.ts`;
-                if (args.onEvent && typeof args.onEvent.onmessage === "function") {
-                    args.onEvent.onmessage({ event: "started", progress: 0, downloadedBytes: 0, totalBytes: null, completedSegments: null, totalSegments: 2, fileName });
-                    args.onEvent.onmessage({ event: "progress", progress: 50, downloadedBytes: 1024, totalBytes: null, completedSegments: 1, totalSegments: 2, fileName: null });
-                    args.onEvent.onmessage({ event: "progress", progress: 100, downloadedBytes: 2048, totalBytes: null, completedSegments: 2, totalSegments: 2, fileName: null });
-                }
                 state.last_download = args.request;
                 const record = {
                     id: args.request.id,
@@ -457,12 +474,73 @@ def mocked_page(page, vite_server):
             return null;
         };
 
-        window.__tauri_ipc__ = async function(message) {
-            console.log("Mocked IPC message called:", message);
-            return null;
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async (input, init = {}) => {
+            const url = new URL(typeof input === "string" ? input : input.url, location.href);
+            if (!url.pathname.startsWith("/api")) return nativeFetch(input, init);
+            const method = (init.method || "GET").toUpperCase();
+            const path = url.pathname.slice(4);
+            const body = init.body ? JSON.parse(String(init.body)) : {};
+            let cmd;
+            let args = body;
+
+            if (method === "GET" && path === "/session") {
+                return Response.json({ id: "viewer-1", username: "viewer", role: "admin" });
+            } else if (method === "POST" && path === "/login") {
+                return Response.json({ id: "viewer-1", username: body.username, role: "admin" });
+            } else if (method === "POST" && path === "/logout") {
+                return new Response(null, { status: 204 });
+            } else if (method === "GET" && path === "/sources") cmd = "list_sources";
+            else if (method === "GET" && path === "/providers/health") cmd = "list_provider_health";
+            else if (method === "POST" && path === "/providers/health") cmd = "retry_provider_health";
+            else if (method === "GET" && path === "/discovery") cmd = "get_discovery";
+            else if (method === "GET" && path.startsWith("/catalog/genre/")) {
+                cmd = "get_genre_catalog";
+                args = { genre: decodeURIComponent(path.slice("/catalog/genre/".length)) };
+            } else if (method === "POST" && path === "/catalog") cmd = "get_catalog";
+            else if (method === "GET" && path === "/catalog/search") {
+                cmd = "search_catalog";
+                args = { query: url.searchParams.get("query") || "" };
+            } else if (method === "POST" && path === "/availability") cmd = "resolve_availability";
+            else if (method === "GET" && path === "/history") cmd = "get_continue_watching";
+            else if (method === "GET" && path === "/my-list") cmd = "get_my_list";
+            else if (method === "POST" && path === "/source/search") cmd = "search_source";
+            else if (method === "POST" && path === "/anime/details") cmd = "get_anime_details";
+            else if (method === "POST" && path === "/anime/episodes") cmd = "get_episodes";
+            else if (method === "POST" && path === "/playback") cmd = "prepare_playback";
+            else if (method === "POST" && path === "/skip-times") cmd = "get_skip_times";
+            else if (method === "POST" && path === "/downloads/ticket") {
+                cmd = "download_episode";
+                args = { request: body };
+            } else if (method === "POST" && path === "/history") {
+                cmd = "save_progress";
+                args = { progress: body };
+            } else if (method === "POST" && path === "/my-list") {
+                cmd = "add_to_my_list";
+                args = { anime: body };
+            } else if (method === "POST" && path === "/my-list/remove") cmd = "remove_from_my_list";
+            else if (method === "POST" && path === "/history/remove") cmd = "remove_continue_watching";
+
+            if (!cmd) return Response.json({ code: "NOT_FOUND", message: `No mock for ${method} ${path}` }, { status: 404 });
+            try {
+                const result = await invokeMock(cmd, args);
+                if (cmd === "download_episode") {
+                    return Response.json({ id: result.id, url: "data:video/mp2t,download", fileName: result.fileName });
+                }
+                return result == null ? new Response(null, { status: 204 }) : Response.json(result);
+            } catch (error) {
+                const detail = typeof error === "object" && error !== null ? error : {
+                    code: "UNEXPECTED_ERROR",
+                    message: String(error),
+                    operation: cmd,
+                    retryable: false,
+                    correlationId: "mock-error",
+                };
+                return Response.json(detail, { status: 503 });
+            }
         };
     """)
-    page.goto("http://127.0.0.1:1420")
+    page.goto(f"http://127.0.0.1:{vite_port}")
     page.evaluate("localStorage.clear()")
     page.reload()
     page.wait_for_selector(".app-container, #root")
@@ -473,9 +551,85 @@ def mobile_mocked_page(mocked_page):
     mocked_page.set_viewport_size({"width": 390, "height": 844})
     return mocked_page
 
+@pytest.fixture(scope="function")
+def tauri_mocked_page(mocked_page):
+    mocked_page.add_init_script("""
+        window.__TAURI_INTERNALS__ = window.__TAURI_INTERNALS__ || {};
+        window.__TAURI_CALLS__ = window.__TAURI_CALLS__ || [];
+        window.__TAURI_CALLBACKS__ = window.__TAURI_CALLBACKS__ || {};
+        window.__TAURI_CALLBACK_ID__ = window.__TAURI_CALLBACK_ID__ || 1;
+        window.__TAURI_INTERNALS__.transformCallback = window.__TAURI_INTERNALS__.transformCallback || ((callback) => {
+            const id = window.__TAURI_CALLBACK_ID__++;
+            window.__TAURI_CALLBACKS__[id] = callback;
+            return id;
+        });
+        window.__TAURI_INTERNALS__.unregisterCallback = window.__TAURI_INTERNALS__.unregisterCallback || ((id) => {
+            delete window.__TAURI_CALLBACKS__[id];
+        });
+        const getTauriMockState = () => {
+            const defaults = {
+                update_available: false,
+                update_error: null,
+                update_install_error: null,
+                update_installed: false,
+                relaunched: false,
+            };
+            const stored = localStorage.getItem('__TAURI_MOCK_STATE__');
+            if (stored) {
+                try {
+                    return { ...defaults, ...JSON.parse(stored) };
+                } catch (e) {}
+            }
+            return defaults;
+        };
+        const saveTauriMockState = (state) => {
+            localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        };
+        window.__TAURI_MOCK_STATE__ = getTauriMockState();
+        window.__TAURI_INTERNALS__.invoke = async function (cmd, args = {}) {
+            window.__TAURI_CALLS__.push({ cmd, args });
+            const state = getTauriMockState();
+            if (cmd === "plugin:updater|check") {
+                if (state.update_error) {
+                    throw new Error(state.update_error);
+                }
+                if (!state.update_available) {
+                    return null;
+                }
+                return {
+                    rid: 101,
+                    currentVersion: "1.0.1",
+                    version: "1.0.2",
+                    date: "2026-06-14T00:00:00Z",
+                    body: "Mock v1.0.2 updater release.",
+                    rawJson: {}
+                };
+            } else if (cmd === "plugin:updater|download_and_install") {
+                if (state.update_install_error) {
+                    throw new Error(state.update_install_error);
+                }
+                if (args.onEvent && typeof args.onEvent.onmessage === "function") {
+                    args.onEvent.onmessage({ event: "Started", data: { contentLength: 1000 } });
+                    args.onEvent.onmessage({ event: "Progress", data: { chunkLength: 450 } });
+                    args.onEvent.onmessage({ event: "Progress", data: { chunkLength: 550 } });
+                    args.onEvent.onmessage({ event: "Finished" });
+                }
+                state.update_installed = true;
+                saveTauriMockState(state);
+                return null;
+            } else if (cmd === "plugin:process|restart") {
+                state.relaunched = true;
+                saveTauriMockState(state);
+                return null;
+            }
+            return invokeMock(cmd, args);
+        };
+    """)
+    return mocked_page
 
 @pytest.fixture(scope="function")
 def hosted_page(page, vite_server):
+    vite_proc, vite_port = vite_server
     state = {
         "signed_in": False,
         "users": [
@@ -493,11 +647,11 @@ def hosted_page(page, vite_server):
     console_errors = []
     page_errors = []
     sources = [
-        {"name": "AllAnime", "language": "English", "languageGroup": "english", "status": "degraded", "failureCode": None, "websiteUrl": None, "verificationUrl": "https://api.allanime.day/api", "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
-        {"name": "AnimeGG", "language": "English", "languageGroup": "english", "status": "healthy", "failureCode": None, "websiteUrl": "https://www.animegg.org", "verificationUrl": None, "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": False}},
-        {"name": "MovieBox", "language": "English", "languageGroup": "english", "status": "healthy", "failureCode": None, "websiteUrl": "https://moviebox.ph", "verificationUrl": None, "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
-        {"name": "KKPhim", "language": "Vietnamese", "languageGroup": "vietnamese", "status": "healthy", "failureCode": None, "websiteUrl": "https://www.kkphim.com", "verificationUrl": None, "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
-        {"name": "OPhim", "language": "Vietnamese", "languageGroup": "vietnamese", "status": "healthy", "failureCode": None, "websiteUrl": "https://ophim19.cc", "verificationUrl": None, "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
+        {"name": "AllAnime", "language": "English", "languageGroup": "english", "status": "degraded", "failureCode": None, "websiteUrl": None, "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
+        {"name": "AnimeGG", "language": "English", "languageGroup": "english", "status": "healthy", "failureCode": None, "websiteUrl": "https://www.animegg.org", "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": False}},
+        {"name": "MovieBox", "language": "English", "languageGroup": "english", "status": "healthy", "failureCode": None, "websiteUrl": "https://moviebox.ph", "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
+        {"name": "KKPhim", "language": "Vietnamese", "languageGroup": "vietnamese", "status": "healthy", "failureCode": None, "websiteUrl": "https://www.kkphim.com", "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
+        {"name": "OPhim", "language": "Vietnamese", "languageGroup": "vietnamese", "status": "healthy", "failureCode": None, "websiteUrl": "https://ophim19.cc", "capabilities": {"search": True, "details": True, "episodes": True, "playback": True, "subtitles": True}},
     ]
     user = {"id": "family-admin", "username": "family-admin", "role": "admin"}
 
@@ -568,7 +722,7 @@ def hosted_page(page, vite_server):
     page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.route("**/api/**", handle_api)
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto("http://127.0.0.1:1420")
+    page.goto(f"http://127.0.0.1:{vite_port}")
     page.wait_for_selector(".login-screen")
     setattr(page, "ani_console_errors", console_errors)
     setattr(page, "ani_page_errors", page_errors)

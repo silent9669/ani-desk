@@ -1,4 +1,4 @@
-use super::{Anime, AnimeProvider, Episode, Language, StreamInfo};
+use super::{Anime, AnimeProvider, Episode, Language, ProviderCapabilities, StreamInfo};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
@@ -110,6 +110,7 @@ impl AnimeGgProvider {
                 Some(Episode {
                     id: capture["id"].to_string(),
                     number,
+                    aniskip_episode_number: None,
                     title: Some(clean_html(&capture["title"])),
                     thumbnail: None,
                 })
@@ -160,6 +161,7 @@ impl AnimeGgProvider {
             subtitles: Vec::new(),
             qualities: sources.into_iter().map(|source| source.1).collect(),
             headers,
+            use_curl: false,
         })
     }
 }
@@ -180,6 +182,13 @@ impl AnimeProvider for AnimeGgProvider {
 
     fn website_url(&self) -> Option<&'static str> {
         Some(BASE_URL)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            subtitles: false,
+            ..ProviderCapabilities::default()
+        }
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Anime>> {
@@ -245,7 +254,10 @@ impl AnimeProvider for AnimeGgProvider {
         let mut last_error = None;
         for episode in episodes.into_iter().rev().take(24) {
             match self.get_stream_url(&episode.id).await {
-                Ok(_) => return Ok(()),
+                Ok(stream) => match super::probe_stream(&stream).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(error),
+                },
                 Err(error) => last_error = Some(error),
             }
         }
