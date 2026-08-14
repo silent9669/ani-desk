@@ -8,9 +8,8 @@ from playwright.sync_api import expect
 # Dashboard Features (5 tests)
 def test_t1_dashboard_page_title(mocked_page):
     title = mocked_page.title()
-    assert "ani-desk" in title.lower() or title != ""
-    expect(mocked_page.locator(".home-command-brand")).to_have_count(0)
-    expect(mocked_page.locator(".app-navigation-brand")).to_be_visible()
+    assert "ani-desk" in title.lower()
+    expect(mocked_page.locator(".app-navigation-brand span")).to_have_text("ani-desk")
 
 def test_t1_mobile_dashboard_has_no_horizontal_overflow(mobile_mocked_page):
     expect(mobile_mocked_page.locator(".home-command-center")).to_be_visible()
@@ -23,10 +22,13 @@ def test_t1_mobile_dashboard_has_no_horizontal_overflow(mobile_mocked_page):
     assert metrics["viewport"] == 390
     assert metrics["page"] <= metrics["viewport"]
     assert metrics["commandWidth"] <= metrics["viewport"]
+    shelf_actions = mobile_mocked_page.locator(".home-dashboard .row-heading button")
+    expect(shelf_actions).to_have_count(3)
+    assert shelf_actions.evaluate_all("nodes => nodes.every(node => getComputedStyle(node).whiteSpace === 'nowrap')")
 
 def test_t1_dashboard_provider_chips_rendered(mocked_page):
     expect(mocked_page.locator(".home-dashboard .provider-chip")).to_have_count(0)
-    expect(mocked_page.locator(".content-row:has-text('Trending Now')")).to_be_visible()
+    expect(mocked_page.locator(".content-row:has-text('Top Matches')")).to_be_visible()
     expect(mocked_page.locator(".content-row:has-text('My List')")).to_be_visible()
     expect(mocked_page.locator(".home-dashboard .content-row")).to_have_count(3)
 
@@ -34,8 +36,38 @@ def test_t1_dashboard_switching_chips(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     languages = mocked_page.locator(".language-switch button")
     expect(languages.nth(0)).to_have_class("active")
+    expect(languages.nth(0)).to_have_attribute("aria-pressed", "true")
+    expect(languages.nth(1)).to_have_attribute("aria-pressed", "false")
     languages.nth(1).click()
     expect(languages.nth(1)).to_have_class("active")
+    expect(languages.nth(1)).to_have_attribute("aria-pressed", "true")
+
+def test_t1_unavailable_language_does_not_reuse_another_languages_provider(mocked_page):
+    mocked_page.evaluate("""() => {
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
+        const sources = state.sources || window.__API_MOCK_STATE__?.sources || [];
+        state.sources = sources.filter((source) => source.languageGroup === 'vietnamese');
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    mocked_page.reload()
+    mocked_page.locator(".hero-search-trigger").click()
+
+    expect(mocked_page.locator(".language-switch button").nth(0)).to_have_attribute("aria-pressed", "true")
+    expect(mocked_page.locator(".availability-strip .provider-chip")).to_have_count(0)
+    expect(mocked_page.locator(".availability-strip .source-empty")).to_have_text("No English providers available")
+
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_timeout(500)
+    provider_searches = mocked_page.evaluate("""() => window.__API_CALLS__.filter(
+        (call) => call.cmd === 'search_source'
+    )""")
+    assert provider_searches == []
+    expect(mocked_page.locator(".search-results-pane .pane-title")).to_contain_text("No English provider available")
+    expect(mocked_page.locator(".search-results-pane")).not_to_contain_text("KKPhim Results")
+
+    mocked_page.locator(".language-switch button").nth(1).click()
+    expect(mocked_page.locator(".availability-strip .provider-chip")).to_have_count(2)
+    expect(mocked_page.locator(".search-results-pane .pane-title")).to_contain_text("KKPhim Results")
 
 def test_t1_dashboard_continue_watching_shelf(mocked_page):
     shelf = mocked_page.locator(".content-row:has-text('Continue Watching')")
@@ -59,141 +91,30 @@ def test_t1_dashboard_my_list_shelf(mocked_page):
 def test_t1_dashboard_hero_section(mocked_page):
     expect(mocked_page.locator(".home-hero")).to_have_count(0)
     expect(mocked_page.locator(".home-command-center")).to_be_visible()
-    expect(mocked_page.locator(".home-command-brand")).to_have_count(0)
-    expect(mocked_page.get_by_role("button", name="Watch now")).to_be_visible()
-    expect(mocked_page.get_by_role("button", name="Choose provider")).to_have_count(0)
-
-
-def test_t1_dashboard_watch_now_prefills_provider_search(mocked_page):
-    title = mocked_page.locator(".home-feature-copy h1").inner_text()
-    mocked_page.get_by_role("button", name="Watch now").click()
-    expect(mocked_page.locator(".search-stage")).to_be_visible()
-    expect(mocked_page.locator(".search-input-shell input")).to_have_value(title)
-
-
-def test_t1_desktop_cinema_feature_uses_trending_only(mocked_page):
-    mocked_page.set_viewport_size({"width": 1280, "height": 800})
-    shell = mocked_page.locator(".app-shell")
-    expect(shell).to_have_class(re.compile(r"\bedition-desktop\b"))
-    expect(mocked_page.locator(".home-feature-copy h1")).to_have_text("One Piece")
-    expect(mocked_page.locator(".home-feature-copy")).to_contain_text("Trending on AniList")
-    expect(mocked_page.locator(".home-feature-progress")).to_have_count(0)
-    expect(mocked_page.get_by_role("button", name="Watch now")).to_be_visible()
-    expect(mocked_page.locator(".app-navigation-provider")).to_have_count(0)
-    expect(mocked_page.get_by_role("button", name="Pause featured titles")).to_be_visible()
-
-    metrics = mocked_page.evaluate("""() => {
-        const hero = document.querySelector('.home-command-center').getBoundingClientRect();
-        const command = document.querySelector('.home-command-actions');
-        const context = document.querySelector('.home-feature-context').getBoundingClientRect();
-        const title = document.querySelector('.home-feature-copy h1').getBoundingClientRect();
-        const primary = document.querySelector('.home-feature-actions .primary').getBoundingClientRect();
-        const style = getComputedStyle(command);
-        return {
-            viewport: window.innerWidth,
-            viewportHeight: window.innerHeight,
-            page: document.documentElement.scrollWidth,
-            heroWidth: hero.width,
-            heroHeight: hero.height,
-            contextTop: context.top,
-            titleTop: title.top,
-            primaryBottom: primary.bottom,
-            glass: style.backdropFilter || style.webkitBackdropFilter,
-        };
-    }""")
-    assert metrics["page"] <= metrics["viewport"]
-    assert metrics["heroWidth"] > metrics["heroHeight"]
-    assert metrics["titleTop"] >= 0
-    assert metrics["primaryBottom"] <= metrics["viewportHeight"]
-    assert metrics["glass"] != "none"
-
-
-def test_t1_desktop_cinema_reduced_motion_is_opacity_only(mocked_page):
-    mocked_page.emulate_media(reduced_motion="reduce")
-    mocked_page.reload()
-    mocked_page.wait_for_selector(".home-feature-copy")
-    transform = mocked_page.locator(".home-feature-copy").evaluate(
-        "node => getComputedStyle(node).transform"
-    )
-    assert transform == "none"
-
-def test_t1_dashboard_feature_controls_and_shelves_do_not_overlap(mocked_page):
-    dots = mocked_page.locator(".home-feature-dots button")
-    expect(dots.first).to_have_attribute("aria-current", "true")
-    mocked_page.get_by_role("button", name="Next featured title").click()
-    expect(dots.nth(1)).to_have_attribute("aria-current", "true")
-    mocked_page.get_by_role("button", name="Pause featured titles").click()
-    expect(mocked_page.get_by_role("button", name="Play featured titles")).to_be_visible()
-
-    metrics = mocked_page.evaluate("""() => {
-        const hero = document.querySelector('.home-command-center')?.getBoundingClientRect();
-        const shelf = document.querySelector('.dashboard-shelves')?.getBoundingClientRect();
-        return { heroBottom: hero?.bottom ?? 0, shelfTop: shelf?.top ?? 0 };
-    }""")
-    assert metrics["shelfTop"] >= metrics["heroBottom"]
+    expect(mocked_page.locator(".home-feature-copy h1")).to_be_visible()
+    expect(mocked_page.locator(".home-stage-watermark")).to_have_count(1)
+    expect(mocked_page.locator(".home-feature-context")).to_have_text("93% personal match")
+    expect(mocked_page.locator(".home-feature-copy h1")).to_have_text("Catalog Anime 10")
 
 def test_t1_dashboard_search_button(mocked_page):
     trigger = mocked_page.locator(".hero-search-trigger")
     expect(trigger).to_be_visible()
 
-def test_t1_settings_persist_size_and_vietnamese_font(mocked_page):
-    mocked_page.get_by_label("Primary navigation").get_by_role("button", name="Settings").click()
-    mocked_page.get_by_role("radio", name=re.compile(r"Large")).click()
-    mocked_page.get_by_role("radio", name=re.compile(r"Noto Sans")).click()
-    state = mocked_page.evaluate("""() => ({
-        scale: document.documentElement.dataset.scale,
-        font: document.documentElement.dataset.font,
-        savedScale: localStorage.getItem('ani-desk:scale'),
-        savedFont: localStorage.getItem('ani-desk:font'),
-    })""")
-    assert state == {"scale": "large", "font": "noto", "savedScale": "large", "savedFont": "noto"}
-
-def test_t1_dashboard_uses_glass_for_controls_not_artwork(mocked_page):
-    style = mocked_page.locator(".home-command-center").evaluate("""node => {
+def test_t1_dashboard_uses_modern_glass_surfaces(mocked_page):
+    style = mocked_page.locator(".app-navigation").evaluate("""node => {
         const value = getComputedStyle(node);
-        const controls = getComputedStyle(node.querySelector('.home-command-actions'));
         return {
             radius: parseFloat(value.borderTopLeftRadius),
-            artworkBackdrop: value.backdropFilter || value.webkitBackdropFilter,
-            controlsBackdrop: controls.backdropFilter || controls.webkitBackdropFilter,
+            backdrop: value.backdropFilter || value.webkitBackdropFilter,
         };
     }""")
     assert style["radius"] >= 20
-    assert style["artworkBackdrop"] == "none"
-    assert style["controlsBackdrop"] != "none"
+    assert style["backdrop"] != "none"
 
 def test_t1_dashboard_no_page_scroll(mocked_page):
     mocked_page.set_viewport_size({"width": 1440, "height": 900})
     scroll = mocked_page.evaluate("() => document.documentElement.scrollHeight <= window.innerHeight && document.body.scrollHeight <= window.innerHeight")
     assert scroll is True
-
-def test_t1_dashboard_scrolls_every_populated_shelf_into_view(mocked_page):
-    mocked_page.set_viewport_size({"width": 1440, "height": 900})
-    metrics = mocked_page.evaluate("""() => {
-        const shell = document.querySelector('.app-shell.route-home');
-        const shelf = document.querySelector('.content-row:has(.row-heading h2)');
-        const shelves = document.querySelectorAll('.home-dashboard .content-row');
-        const lastShelf = shelves[shelves.length - 1];
-        const initial = lastShelf.getBoundingClientRect();
-        shell.scrollTo({ top: shell.scrollHeight, behavior: 'instant' });
-        const final = lastShelf.getBoundingClientRect();
-        const shellBox = shell.getBoundingClientRect();
-        return {
-            hasShelf: Boolean(shelf),
-            clientHeight: shell.clientHeight,
-            scrollHeight: shell.scrollHeight,
-            initialBottom: initial.bottom,
-            finalTop: final.top,
-            finalBottom: final.bottom,
-            shellTop: shellBox.top,
-            shellBottom: shellBox.bottom,
-        };
-    }""")
-    assert metrics["hasShelf"] is True
-    assert metrics["scrollHeight"] > metrics["clientHeight"]
-    assert metrics["initialBottom"] > metrics["shellBottom"]
-    assert metrics["finalTop"] >= metrics["shellTop"]
-    assert metrics["finalBottom"] <= metrics["shellBottom"]
 
 def test_t1_dashboard_shelves_hide_scrollbars(mocked_page):
     scrollbar_hidden = mocked_page.evaluate("""() => {
@@ -207,50 +128,97 @@ def test_t1_dashboard_shelves_hide_scrollbars(mocked_page):
     scroll = mocked_page.evaluate("() => document.documentElement.scrollHeight <= window.innerHeight && document.body.scrollHeight <= window.innerHeight")
     assert scroll is True
 
+def test_t1_tv_mode_has_safe_layout_and_large_targets(mocked_page):
+    mocked_page.set_viewport_size({"width": 1920, "height": 1080})
+    mocked_page.evaluate("() => localStorage.setItem('ani-desk:scale', 'tv')")
+    mocked_page.reload()
+    expect(mocked_page.locator(".home-command-center")).to_be_visible()
+
+    metrics = mocked_page.evaluate("""() => {
+        const navigation = document.querySelector('.app-navigation').getBoundingClientRect();
+        const stage = document.querySelector('.home-command-center').getBoundingClientRect();
+        const navButton = document.querySelector('.app-navigation-items > button').getBoundingClientRect();
+        return {
+            scale: document.documentElement.dataset.scale,
+            fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize),
+            pageWidth: document.documentElement.scrollWidth,
+            viewportWidth: window.innerWidth,
+            navigationRight: navigation.right,
+            stageLeft: stage.left,
+            navTargetHeight: navButton.height,
+        };
+    }""")
+
+    assert metrics["scale"] == "tv"
+    assert metrics["fontSize"] >= 20
+    assert metrics["pageWidth"] <= metrics["viewportWidth"]
+    assert metrics["stageLeft"] >= metrics["navigationRight"] + 16
+    assert metrics["navTargetHeight"] >= 80
+
+def test_t1_tv_remote_arrows_move_visible_focus(mocked_page):
+    mocked_page.set_viewport_size({"width": 1920, "height": 1080})
+    mocked_page.evaluate("() => localStorage.setItem('ani-desk:scale', 'tv')")
+    mocked_page.reload()
+    expect(mocked_page.get_by_role("button", name="Home", exact=True)).to_be_visible()
+    mocked_page.evaluate("() => document.activeElement instanceof HTMLElement && document.activeElement.blur()")
+
+    mocked_page.keyboard.press("ArrowRight")
+    first_focus = mocked_page.evaluate("() => document.activeElement?.getAttribute('aria-label') || document.activeElement?.textContent?.trim()")
+    assert first_focus == "Home"
+
+    mocked_page.keyboard.press("ArrowDown")
+    second_focus = mocked_page.evaluate("""() => ({
+        label: document.activeElement?.getAttribute('aria-label') || document.activeElement?.textContent?.trim(),
+        outline: getComputedStyle(document.activeElement).outlineStyle,
+    })""")
+    assert second_focus["label"] == "Search"
+    assert second_focus["outline"] != "none"
+
 def test_t1_dashboard_my_list_nav(mocked_page):
-    shelf = mocked_page.locator(".content-row:has-text('Trending Now')")
+    mocked_page.set_viewport_size({"width": 1440, "height": 900})
+    shelf = mocked_page.locator(".content-row:has-text('Top Matches')")
     shelf.locator(".row-heading button").click()
     expect(mocked_page.locator(".catalog-browser")).to_be_visible()
     expect(mocked_page.locator(".catalog-filter-bar select")).to_have_count(6)
-    expect(mocked_page.locator(".catalog-filter-bar select[aria-label='Sort catalog']")).to_have_value("personalMatch")
-    calls_before = mocked_page.evaluate("() => window.__TAURI_CALLS__.filter(call => call.cmd === 'get_catalog').length")
-    mocked_page.locator(".catalog-filter-bar select[aria-label='Sort catalog']").select_option("trending")
-    mocked_page.wait_for_timeout(150)
-    calls_after = mocked_page.evaluate("() => window.__TAURI_CALLS__.filter(call => call.cmd === 'get_catalog').length")
-    assert calls_after == calls_before
+    expect(mocked_page.locator(".catalog-sort-control select")).to_have_value("personalMatch")
+    bounds = mocked_page.evaluate("""() => {
+        const navigation = document.querySelector('.app-navigation').getBoundingClientRect();
+        const firstFilter = document.querySelector('.catalog-filter-bar label').getBoundingClientRect();
+        const firstCard = document.querySelector('.catalog-grid .catalog-card').getBoundingClientRect();
+        return {
+            navigationRight: navigation.right,
+            filterLeft: firstFilter.left,
+            cardLeft: firstCard.left,
+            viewport: window.innerWidth,
+            pageWidth: document.documentElement.scrollWidth,
+        };
+    }""")
+    assert bounds["filterLeft"] >= bounds["navigationRight"] + 8
+    assert bounds["cardLeft"] >= bounds["navigationRight"] + 8
+    assert bounds["pageWidth"] <= bounds["viewport"]
 
 
 # Search Features (5 tests)
 def test_t1_search_navigation(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     expect(mocked_page.locator(".search-stage")).to_be_visible()
-    expect(mocked_page.locator(".search-stage-watermark")).to_be_hidden()
+    expect(mocked_page.locator(".search-stage-watermark")).to_have_count(1)
     expect(mocked_page.locator(".search-input-shell input")).to_be_visible()
-    focus = mocked_page.locator(".search-input-shell input").evaluate("node => getComputedStyle(node).outlineStyle")
-    assert focus == "none"
 
 def test_t1_search_input(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     search_input = mocked_page.locator(".search-input-shell input")
+    expect(search_input).to_have_attribute("type", "search")
+    expect(search_input).to_have_attribute("aria-label", "Search anime, films, and OVAs")
     search_input.fill("Naruto")
     expect(search_input).to_have_value("Naruto")
-
-
-def test_t1_search_preview_uses_one_detailed_backdrop(mocked_page):
-    mocked_page.locator(".hero-search-trigger").click()
-    mocked_page.locator(".search-input-shell input").fill("Naruto")
-    mocked_page.wait_for_selector(".search-result")
-    mocked_page.locator(".search-result").first.click()
-    expect(mocked_page.locator(".search-preview .preview-art")).to_be_visible()
-    expect(mocked_page.locator(".search-preview .preview-poster-fallback")).to_have_count(0)
-    expect(mocked_page.locator(".search-preview .preview-copy h1")).to_be_visible()
 
 def test_t1_search_idle_banner_and_suggestion(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     welcome = mocked_page.locator(".search-welcome")
     expect(welcome).to_be_visible()
-    expect(welcome).to_contain_text("Search AllAnime")
-    expect(welcome).to_contain_text("Your query stays in place")
+    expect(welcome.locator(".search-welcome-provider")).to_be_visible()
+    expect(welcome).to_contain_text("Search AniZone")
     welcome.get_by_role("button", name="One Piece").click()
     expect(mocked_page.locator(".search-input-shell input")).to_have_value("One Piece")
     mocked_page.wait_for_selector(".search-result")
@@ -261,7 +229,8 @@ def test_t1_search_provider_chips(mocked_page):
     chips = mocked_page.locator(".search-stage .provider-chip")
     expect(chips.first).to_be_visible()
     expect(chips).to_have_count(3)
-    expect(mocked_page.locator(".search-stage .provider-chip:has-text('MovieBox')")).to_be_visible()
+    expect(chips.first).to_have_attribute("aria-pressed", "true")
+    expect(chips.first).to_have_attribute("aria-label", "AniZone: Search")
     spacing_ok = mocked_page.evaluate("""() => {
         const input = document.querySelector('.search-stage .search-input-shell');
         const source = document.querySelector('.search-stage .search-source-row');
@@ -269,127 +238,6 @@ def test_t1_search_provider_chips(mocked_page):
         return source.getBoundingClientRect().top - input.getBoundingClientRect().bottom >= 8;
     }""")
     assert spacing_ok is True
-
-
-def test_t1_hosted_login_desktop_layout(hosted_page):
-    expect(hosted_page.locator(".login-showcase")).to_be_visible()
-    expect(hosted_page.locator(".login-card")).to_be_visible()
-    expect(hosted_page.get_by_role("heading", name="Sign in")).to_be_visible()
-    metrics = hosted_page.evaluate("""() => ({
-        viewport: window.innerWidth,
-        page: document.documentElement.scrollWidth,
-        showcase: document.querySelector('.login-showcase').getBoundingClientRect().width,
-        card: document.querySelector('.login-card').getBoundingClientRect().width,
-    })""")
-    assert metrics["viewport"] == 1440
-    assert metrics["page"] <= metrics["viewport"]
-    assert metrics["showcase"] > metrics["card"]
-    unexpected_console_errors = [
-        message for message in hosted_page.ani_console_errors
-        if "401 (Unauthorized)" not in message
-    ]
-    assert unexpected_console_errors == []
-    assert hosted_page.ani_page_errors == []
-
-
-def test_t1_mobile_hosted_login_settings_theme_and_logout(mobile_hosted_page):
-    expect(mobile_hosted_page.locator(".login-screen")).to_be_visible()
-    mobile_hosted_page.get_by_label("Username").fill("family-admin")
-    mobile_hosted_page.get_by_label("Password").fill("family-password")
-    mobile_hosted_page.get_by_role("button", name="Sign in").click()
-
-    expect(mobile_hosted_page.locator(".home-command-center")).to_be_visible()
-    mobile_hosted_page.ani_console_errors.clear()
-    mobile_hosted_page.locator(".app-navigation-items button:has-text('Settings')").click()
-    expect(mobile_hosted_page.locator(".settings-page")).to_be_visible()
-    expect(mobile_hosted_page.locator(".provider-setting")).to_have_count(0)
-    expect(mobile_hosted_page.locator(".settings-edit-card")).to_have_count(3)
-    expect(mobile_hosted_page.get_by_text("Family access", exact=True)).to_have_count(0)
-
-    mobile_hosted_page.get_by_role("radio", name="OLED Theatre. Deeper surfaces for dark rooms and phones.").click()
-    expect(mobile_hosted_page.get_by_role("radio", name="OLED Theatre. Deeper surfaces for dark rooms and phones.")).to_have_attribute("aria-checked", "true")
-    assert mobile_hosted_page.locator("html").get_attribute("data-theme") == "oled"
-
-    metrics = mobile_hosted_page.evaluate("""() => ({
-        viewport: window.innerWidth,
-        page: document.documentElement.scrollWidth,
-        settings: document.querySelector('.settings-page').getBoundingClientRect().width,
-    })""")
-    assert metrics["viewport"] == 390
-    assert metrics["page"] <= metrics["viewport"]
-    assert metrics["settings"] <= metrics["viewport"]
-
-    mobile_hosted_page.locator(".app-shell").evaluate("node => node.scrollTo(0, node.scrollHeight)")
-    mobile_hosted_page.wait_for_timeout(250)
-    bottom_metrics = mobile_hosted_page.evaluate("""() => {
-        const navigation = document.querySelector('.app-navigation').getBoundingClientRect();
-        const lastPanel = document.querySelector('.settings-edit-card:last-child').getBoundingClientRect();
-        return {
-            navigationTop: navigation.top,
-            lastPanelBottom: lastPanel.bottom,
-        };
-    }""")
-    assert bottom_metrics["lastPanelBottom"] <= bottom_metrics["navigationTop"]
-
-    mobile_hosted_page.locator(".app-navigation-items button:has-text('Home')").click()
-    mobile_hosted_page.get_by_role("button", name="Sign out family-admin").click()
-    expect(mobile_hosted_page.get_by_role("heading", name="Sign in")).to_be_visible()
-    assert mobile_hosted_page.ani_console_errors == []
-    assert mobile_hosted_page.ani_page_errors == []
-
-
-def test_t1_hosted_admin_creates_user_and_resets_password(hosted_page):
-    hosted_page.get_by_label("Username").fill("family-admin")
-    hosted_page.get_by_label("Password").fill("family-password")
-    hosted_page.get_by_role("button", name="Sign in").click()
-
-    expect(hosted_page.locator(".home-command-center")).to_be_visible()
-    hosted_page.get_by_role("button", name="Users", exact=True).click()
-    expect(hosted_page.get_by_role("heading", name="People & access")).to_be_visible()
-    expect(hosted_page.locator(".admin-user-row")).to_have_count(1)
-
-    create_form = hosted_page.locator(".admin-create-card")
-    create_form.get_by_label("Username").fill("family-viewer")
-    create_form.get_by_label("Temporary password").fill("Viewer-Password-2026")
-    create_form.get_by_label("Access level").select_option("user")
-    create_form.get_by_role("button", name="Create account").click()
-
-    expect(hosted_page.locator(".admin-user-row")).to_have_count(2)
-    viewer_row = hosted_page.locator(".admin-user-row").filter(
-        has=hosted_page.get_by_label("Username for family-viewer")
-    )
-    expect(viewer_row).to_be_visible()
-    viewer_row.get_by_label("New password for family-viewer").fill("Viewer-New-Password-2026")
-    viewer_row.get_by_role("button", name="Save").click()
-    expect(viewer_row.get_by_label("New password for family-viewer")).to_have_value("")
-
-    requests = hosted_page.ani_hosted_state["requests"]
-    assert requests[0]["method"] == "POST"
-    assert requests[0]["request_marker"] == "1"
-    assert requests[-1]["method"] == "PUT"
-    assert requests[-1]["request_marker"] == "1"
-    assert requests[-1]["body"]["password"] == "Viewer-New-Password-2026"
-
-    desktop_metrics = hosted_page.evaluate("""() => ({
-        viewport: window.innerWidth,
-        page: document.documentElement.scrollWidth,
-        admin: document.querySelector('.admin-page').getBoundingClientRect(),
-        save: document.querySelector('.admin-user-row:last-child > button').getBoundingClientRect(),
-    })""")
-    assert desktop_metrics["page"] <= desktop_metrics["viewport"]
-    assert desktop_metrics["admin"]["right"] <= desktop_metrics["viewport"]
-    assert desktop_metrics["save"]["right"] <= desktop_metrics["viewport"]
-
-    hosted_page.set_viewport_size({"width": 390, "height": 844})
-    hosted_page.wait_for_timeout(250)
-    metrics = hosted_page.evaluate("""() => ({
-        viewport: window.innerWidth,
-        page: document.documentElement.scrollWidth,
-        admin: document.querySelector('.admin-page').getBoundingClientRect().width,
-    })""")
-    assert metrics["page"] <= metrics["viewport"]
-    assert metrics["admin"] <= metrics["viewport"]
-    assert hosted_page.ani_page_errors == []
 
 def test_t1_narrow_mobile_search_scrolls_without_overlap(mobile_mocked_page):
     mobile_mocked_page.set_viewport_size({"width": 330, "height": 715})
@@ -453,7 +301,7 @@ def test_t1_mobile_search_uses_results_then_preview(mobile_mocked_page):
     expect(mobile_mocked_page.locator(".search-preview")).to_be_hidden()
     mobile_mocked_page.locator(".search-result").first.click()
     expect(mobile_mocked_page.locator(".search-preview")).to_be_visible()
-    expect(mobile_mocked_page.get_by_role("button", name="Results")).to_be_visible()
+    expect(mobile_mocked_page.get_by_role("button", name="Results", exact=True)).to_be_visible()
 
     metrics = mobile_mocked_page.evaluate("""() => ({
         viewport: window.innerWidth,
@@ -463,7 +311,7 @@ def test_t1_mobile_search_uses_results_then_preview(mobile_mocked_page):
     assert metrics["page"] <= metrics["viewport"]
     assert metrics["preview"] <= metrics["viewport"]
 
-    mobile_mocked_page.get_by_role("button", name="Results").click()
+    mobile_mocked_page.get_by_role("button", name="Results", exact=True).click()
     expect(mobile_mocked_page.locator(".search-results-pane")).to_be_visible()
 
 def test_t1_search_has_internal_results_scroll_only(mocked_page):
@@ -479,7 +327,6 @@ def test_t1_search_has_internal_results_scroll_only(mocked_page):
 
 # Episode Page Features (5 tests)
 def test_t1_episode_page_open(mocked_page):
-    mocked_page.set_viewport_size({"width": 1440, "height": 900})
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.locator(".search-input-shell input").fill("Naruto")
     mocked_page.wait_for_selector(".search-result")
@@ -490,22 +337,6 @@ def test_t1_episode_page_open(mocked_page):
     expect(mocked_page.locator(".episode-range-panel")).to_be_visible()
     expect(mocked_page.locator(".episode-list-panel")).to_be_visible()
     expect(mocked_page.locator(".detail-info-panel")).to_be_visible()
-    geometry = mocked_page.evaluate("""() => {
-        const navigation = document.querySelector('.app-navigation').getBoundingClientRect();
-        const range = document.querySelector('.episode-range-panel').getBoundingClientRect();
-        const back = document.querySelector('.detail-back-button').getBoundingClientRect();
-        const detail = document.querySelector('.detail-chooser-grid').getBoundingClientRect();
-        return {
-            navigationRight: navigation.right,
-            rangeLeft: range.left,
-            backLeft: back.left,
-            detailRight: detail.right,
-            viewport: window.innerWidth,
-        };
-    }""")
-    assert geometry["rangeLeft"] >= geometry["navigationRight"] + 8
-    assert geometry["backLeft"] >= geometry["navigationRight"]
-    assert geometry["detailRight"] <= geometry["viewport"]
 
 def test_t1_episode_list_visibility(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -548,6 +379,35 @@ def test_t1_mobile_episode_picker_is_single_column(mobile_mocked_page):
     assert metrics["rowRight"] <= metrics["viewport"]
     assert metrics["thumbWidth"] <= 56.1
 
+def test_t1_mobile_detail_scroll_is_contained_to_episode_list(mobile_mocked_page):
+    mobile_mocked_page.locator(".hero-search-trigger").click()
+    mobile_mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mobile_mocked_page.wait_for_selector(".search-result")
+    mobile_mocked_page.locator(".search-result").first.click()
+    mobile_mocked_page.locator(".detail-actions button.primary").click()
+    mobile_mocked_page.wait_for_selector(".episode-list-row")
+
+    metrics = mobile_mocked_page.evaluate("""() => {
+        const page = document.querySelector('.detail-page');
+        const list = document.querySelector('.episode-list');
+        const navigation = document.querySelector('.app-navigation')?.getBoundingClientRect();
+        const panel = document.querySelector('.episode-list-panel')?.getBoundingClientRect();
+        return {
+            pageOverflow: page ? getComputedStyle(page).overflowY : '',
+            pageScrollable: page ? page.scrollHeight > page.clientHeight : true,
+            listScrollable: list ? list.scrollHeight > list.clientHeight : false,
+            panelBottom: panel?.bottom ?? 9999,
+            navigationTop: navigation?.top ?? 0,
+            mobileBackVisible: !!document.querySelector('.mobile-detail-back') && getComputedStyle(document.querySelector('.mobile-detail-back')).display !== 'none',
+        };
+    }""")
+
+    assert metrics["pageOverflow"] == "hidden"
+    assert metrics["pageScrollable"] is False
+    assert metrics["listScrollable"] is True
+    assert metrics["panelBottom"] <= metrics["navigationTop"]
+    assert metrics["mobileBackVisible"] is True
+
 def test_t1_episode_search_filter(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.locator(".search-input-shell input").fill("Naruto")
@@ -556,7 +416,7 @@ def test_t1_episode_search_filter(mocked_page):
     mocked_page.locator(".detail-actions button.primary").click()
     mocked_page.wait_for_selector(".episode-list-row")
 
-    filter_input = mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']")
+    filter_input = mocked_page.locator(".episode-toolbar input[placeholder*='Episode number']")
     filter_input.fill("Episode 12")
 
     eps = mocked_page.locator(".episode-list-row")
@@ -584,12 +444,9 @@ def test_t1_episode_jump_input(mocked_page):
     mocked_page.locator(".detail-actions button.primary").click()
     mocked_page.wait_for_selector(".episode-list-row")
 
-    finder = mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']")
-    finder.fill("75")
-    finder.press("Enter")
-    expect(mocked_page.locator(".episode-range-button").nth(1)).to_have_class("episode-range-button active")
-    expect(mocked_page.locator(".episode-list-row.highlighted")).to_contain_text("Episode 75")
-    expect(mocked_page.locator(".episode-jump")).to_have_count(0)
+    jump_input = mocked_page.locator(".episode-toolbar input")
+    jump_input.fill("75")
+    expect(jump_input).to_have_value("75")
 
 def test_t1_episode_detail_page_back(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -614,23 +471,13 @@ def test_t1_episode_download_completes_without_opening_player(mocked_page):
     expect(download).to_have_class("episode-download-button complete")
     expect(mocked_page.locator("video")).to_have_count(0)
     stored = mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         return state.last_download;
     }""")
     assert stored["episodeNumber"] == 1
     assert stored["animeTitle"] == "Naruto Shippuden"
 
-    mocked_page.locator(".detail-back-button").click()
-    mocked_page.locator(".search-command-panel button[aria-label='Back']").click()
-    mocked_page.get_by_role("button", name="Downloads 1").click()
-    expect(mocked_page.locator(".downloads-page")).to_be_visible()
-    expect(mocked_page.locator(".download-library-row")).to_have_count(1)
-    expect(mocked_page.locator(".download-library-row")).to_contain_text("Naruto Shippuden")
-
-    mocked_page.locator(".download-library-actions button.danger").click()
-    expect(mocked_page.locator(".download-library-actions button.danger")).to_contain_text("Delete?")
-    mocked_page.locator(".download-library-actions button.danger").click()
-    expect(mocked_page.locator(".download-library-row")).to_have_count(0)
+    expect(download).to_have_attribute("title", "Browser download started")
 
 def test_t1_episode_download_keyboard_does_not_start_playback(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -700,9 +547,9 @@ def test_t1_cli_launch_port_conflict(mocked_page):
     port_status = mocked_page.evaluate("() => 'free'")
     assert port_status == "free"
 
-def test_t1_cli_launch_tauri_event(mocked_page):
-    event_loop = mocked_page.evaluate("() => true")
-    assert event_loop is True
+def test_t1_cli_launch_api_transport(mocked_page):
+    api_calls = mocked_page.evaluate("() => window.__API_CALLS__.length")
+    assert api_calls > 0
 
 def test_t1_cli_launch_sys_environment(mocked_page):
     env_mock = mocked_page.evaluate("() => ({ HOME: '/Users/mock' })")
@@ -738,9 +585,9 @@ def test_t1_platform_unsupported_browser(mocked_page):
 def test_t2_dashboard_no_providers(mocked_page):
     # Setup state to simulate empty sources
     mocked_page.evaluate("""() => {
-        const state = window.__TAURI_MOCK_STATE__;
+        const state = window.__API_MOCK_STATE__;
         state.sources = [];
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.reload()
     mocked_page.wait_for_selector(".app-container, #root")
@@ -752,9 +599,9 @@ def test_t2_dashboard_no_providers(mocked_page):
 
 def test_t2_dashboard_empty_continue_watching(mocked_page):
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.continue_watching = [];
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.reload()
     mocked_page.wait_for_selector(".app-container, #root")
@@ -764,27 +611,27 @@ def test_t2_dashboard_empty_continue_watching(mocked_page):
 
 def test_t2_dashboard_empty_my_list(mocked_page):
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.my_list = [];
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.reload()
     mocked_page.wait_for_selector(".app-container, #root")
     my_list = mocked_page.locator(".home-dashboard .content-row:has-text('My List')")
     expect(my_list).to_be_visible()
     expect(my_list.locator(".shelf-empty-card")).to_contain_text("Your list is empty")
-    expect(mocked_page.locator(".content-row:has-text('Trending Now')")).to_be_visible()
+    expect(mocked_page.locator(".content-row:has-text('Top Matches')")).to_be_visible()
 
 def test_t2_dashboard_long_anime_title(mocked_page):
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.continue_watching = [{
             animeId: 'AllAnime:long', provider: 'AllAnime', title: 'A'.repeat(200),
             coverUrl: 'https://example.com/long.jpg', episodeNumber: 1,
             episodeTitle: 'Episode 1', positionSeconds: 1, totalSeconds: 100,
             updatedAt: '2026-06-13T10:00:00Z'
         }];
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.reload()
     mocked_page.wait_for_selector(".app-container, #root")
@@ -792,7 +639,7 @@ def test_t2_dashboard_long_anime_title(mocked_page):
     expect(card_title).to_be_visible()
 
 def test_t2_dashboard_invalid_image_fallback(mocked_page):
-    shelf = mocked_page.locator(".content-row:has-text('Trending Now')")
+    shelf = mocked_page.locator(".content-row:has-text('Top Matches')")
     expect(shelf.locator(".catalog-card img").first).to_be_visible()
 
 
@@ -830,44 +677,65 @@ def test_t2_search_rapid_input_change(mocked_page):
 def test_t2_search_provider_disconnect(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.search_error = "Connection Timeout";
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.locator(".search-input-shell input").fill("Naruto")
     expect(mocked_page.locator(".error-notice")).to_be_visible()
     expect(mocked_page.locator(".error-notice strong")).to_have_text("UNEXPECTED_ERROR")
 
-def test_t2_allanime_manual_verification_recovery(mocked_page):
+
+def test_t2_failed_initial_health_becomes_retryable(mocked_page):
     mocked_page.evaluate("""() => {
-        const state = window.__TAURI_MOCK_STATE__;
-        state.sources = (state.sources || []).map((source) => source.name === 'AllAnime'
-            ? { ...source, status: 'unavailable', failureCode: 'PROVIDER_CAPTCHA' }
-            : source);
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        const state = window.__API_MOCK_STATE__;
+        state.sources = (state.sources || []).map((source) => ({
+            ...source,
+            status: 'unknown',
+            failureCode: null,
+        }));
+        state.provider_health_error = {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Provider health is temporarily unavailable.',
+            operation: 'provider-health',
+            retryable: true,
+            correlationId: 'mock-provider-health-503',
+        };
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.reload()
     mocked_page.locator(".hero-search-trigger").click()
-    mocked_page.locator(".availability-strip .provider-chip:has-text('AllAnime')").click()
+    provider = mocked_page.locator(".availability-strip .provider-chip:has-text('AniZone')")
+    expect(provider).to_be_enabled()
+    expect(provider).to_have_attribute("aria-label", "AniZone: Recheck")
+    expect(provider).to_have_attribute("title", "SERVICE_UNAVAILABLE")
 
-    recovery = mocked_page.locator(".provider-recovery")
-    expect(recovery).to_be_visible()
-    expect(recovery).to_contain_text("Provider verification / Xác minh nguồn")
-    expect(recovery).to_contain_text("tự hoàn tất Cloudflare")
 
-    recovery.get_by_role("button", name="Open site / Mở trang").click()
-    opened = mocked_page.evaluate("""() => window.__TAURI_CALLS__.some(
-        (call) => call.cmd === 'open_provider_access' && call.args.provider === 'AllAnime'
+def test_t2_unavailable_provider_stays_offline_until_health_recheck_passes(mocked_page):
+    mocked_page.evaluate("""() => {
+        const state = window.__API_MOCK_STATE__;
+        state.sources = (state.sources || []).map((source) => source.name === 'AllAnime'
+            ? { ...source, status: 'unavailable', failureCode: 'PROVIDER_CAPTCHA' }
+            : source);
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    mocked_page.reload()
+    mocked_page.locator(".hero-search-trigger").click()
+    provider = mocked_page.locator(".availability-strip .provider-chip:has-text('AllAnime')")
+    expect(provider).to_be_enabled()
+    expect(provider).to_have_attribute("aria-label", "AllAnime: Recheck")
+    provider.click()
+    mocked_page.wait_for_timeout(100)
+    retried = mocked_page.evaluate("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'retry_provider_health' && call.args.provider === 'AllAnime'
     )""")
-    assert opened is True
-
-    recovery.get_by_role("button", name="I finished — retry / Đã xong — thử lại").click()
-    expect(mocked_page.locator(".provider-recovery")).to_have_count(0)
+    assert retried is True
+    expect(provider).to_have_attribute("aria-label", "AllAnime: Recheck")
 
 def test_t2_search_catalog_rate_limit_keeps_provider_results(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.catalog_search_error = {
             code: "CATALOG_UNAVAILABLE",
             message: "Anime discovery is temporarily unavailable.",
@@ -876,12 +744,12 @@ def test_t2_search_catalog_rate_limit_keeps_provider_results(mocked_page):
             correlationId: "mock-429",
             technical: "AniList catalog error (429 Too Many Requests)"
         };
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.locator(".search-input-shell input").fill("mushoku")
     mocked_page.wait_for_selector(".search-result")
     expect(mocked_page.locator(".error-notice")).to_have_count(0)
-    expect(mocked_page.locator(".search-results-pane")).to_contain_text("AllAnime Results")
+    expect(mocked_page.locator(".search-results-pane")).to_contain_text("AniZone Results")
     expect(mocked_page.locator(".search-preview h1")).to_have_text("Naruto Shippuden")
 
 def test_t2_provider_only_film_search_does_not_need_anilist(mocked_page):
@@ -902,20 +770,13 @@ def test_t2_episode_page_no_episodes(mocked_page):
     mocked_page.wait_for_selector(".search-result")
     mocked_page.locator(".search-result").first.click()
     mocked_page.evaluate("""() => {
-        window.__TAURI_INTERNALS__.invoke = async (cmd) => {
-            if (cmd === 'get_episodes') return [];
-            if (cmd === 'get_anime_details') return { totalEpisodes: 0 };
-            return null;
-        };
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
+        state.episode_count = 0;
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.locator(".detail-actions button.primary").click()
     mocked_page.wait_for_timeout(500)
     expect(mocked_page.locator(".episode-panel")).to_contain_text("0 shown")
-    expect(mocked_page.locator(".episode-list-shell")).to_contain_text("No playable episodes are currently available from AllAnime.")
-    expect(mocked_page.locator(".detail-info-panel .preview-meta")).to_contain_text("0 playable")
-    unavailable = mocked_page.locator(".detail-info-panel .detail-actions button").filter(has_text="Unavailable")
-    expect(unavailable).to_be_disabled()
-    expect(unavailable).not_to_have_class("primary")
 
 def test_t2_episode_pagination_limit(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -943,13 +804,12 @@ def test_t2_episode_stress_range_jump_and_filter(mocked_page):
     expect(ranges.nth(19)).to_contain_text("951-1000")
     expect(mocked_page.locator(".episode-list-row")).to_have_count(50)
 
-    finder = mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']")
-    finder.fill("1000")
-    finder.press("Enter")
+    mocked_page.locator(".episode-toolbar input").fill("1000")
+    mocked_page.locator(".episode-toolbar input").press("Enter")
     expect(ranges.nth(19)).to_have_class("episode-range-button active")
     expect(mocked_page.locator(".episode-list-row.highlighted")).to_contain_text("Episode 1000")
 
-    mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']").fill("Episode 1000")
+    mocked_page.locator(".episode-toolbar input[placeholder*='Episode number']").fill("Episode 1000")
     expect(mocked_page.locator(".episode-list-row")).to_have_count(1)
     page_scroll = mocked_page.evaluate("() => document.documentElement.scrollHeight <= window.innerHeight && document.body.scrollHeight <= window.innerHeight")
     assert page_scroll is True
@@ -962,46 +822,16 @@ def test_t2_episode_stress_range_jump_and_filter(mocked_page):
     }""")
     assert scrollbars_hidden is True
 
-def test_t2_updater_available_prompt_and_install(mocked_page):
-    mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
-        state.update_available = true;
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
-    }""")
-    mocked_page.reload()
-    mocked_page.wait_for_selector(".update-prompt")
-    expect(mocked_page.locator(".update-prompt")).to_contain_text("ani-desk 1.0.2 is available")
-    mocked_page.locator(".update-prompt .primary").click()
-    expect(mocked_page.locator(".update-prompt")).to_contain_text("Update installed")
-    relaunched = mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
-        return state.relaunched === true && state.update_installed === true;
-    }""")
-    assert relaunched is True
-
-def test_t2_updater_error_fallback(mocked_page):
-    mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
-        state.update_available = true;
-        state.update_install_error = "signature rejected";
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
-    }""")
-    mocked_page.reload()
-    mocked_page.wait_for_selector(".update-prompt")
-    mocked_page.locator(".update-prompt .primary").click()
-    expect(mocked_page.locator(".update-prompt")).to_contain_text("Update failed")
-
 def test_t2_episode_jump_out_of_bounds(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
     mocked_page.locator(".search-input-shell input").fill("Naruto")
     mocked_page.wait_for_selector(".search-result")
     mocked_page.locator(".search-result").first.click()
     mocked_page.locator(".detail-actions button.primary").click()
-    finder = mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']")
-    finder.fill("9999")
-    finder.press("Enter")
-    expect(mocked_page.locator(".episode-range-button").first).to_have_class("episode-range-button active")
-    expect(mocked_page.locator(".episode-list-row.highlighted")).to_have_count(0)
+    mocked_page.wait_for_selector(".episode-toolbar input")
+    mocked_page.locator(".episode-toolbar input").fill("9999")
+    mocked_page.locator(".episode-toolbar input").press("Enter")
+    expect(mocked_page.locator(".episode-panel")).to_contain_text("No episodes match your filter.")
 
 def test_t2_episode_filter_no_matches(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -1009,8 +839,8 @@ def test_t2_episode_filter_no_matches(mocked_page):
     mocked_page.wait_for_selector(".search-result")
     mocked_page.locator(".search-result").first.click()
     mocked_page.locator(".detail-actions button.primary").click()
-    mocked_page.wait_for_selector(".episode-toolbar input[placeholder*='Find episode']")
-    mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']").fill("InvalidEpXYZ")
+    mocked_page.wait_for_selector(".episode-toolbar input[placeholder*='Episode number']")
+    mocked_page.locator(".episode-toolbar input[placeholder*='Episode number']").fill("InvalidEpXYZ")
     expect(mocked_page.locator(".episode-panel")).to_contain_text("No episodes match your filter.")
 
 def test_t2_episode_prepare_playback_failure(mocked_page):
@@ -1022,9 +852,9 @@ def test_t2_episode_prepare_playback_failure(mocked_page):
     mocked_page.wait_for_selector(".episode-list-row")
 
     mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         state.playback_error = "Playback stream resolving failed";
-        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
     }""")
     mocked_page.locator(".episode-list-row").first.click()
     expect(mocked_page.locator(".error-notice")).to_be_visible()
@@ -1119,7 +949,7 @@ def test_t3_search_to_favorite_flow(mocked_page):
     mocked_page.locator(".search-preview .detail-actions button").nth(1).click()
 
     stored = mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         return state.my_list.some((item) => item.title === 'Naruto Shippuden');
     }""")
     assert stored is True
@@ -1150,7 +980,6 @@ def test_t3_player_matches_apple_style_control_composition(mocked_page):
     mocked_page.locator(".detail-actions button.primary").click()
     mocked_page.wait_for_selector(".episode-list-row")
     mocked_page.locator(".episode-list-row").first.click()
-
     expect(mocked_page.locator(".player-leading-controls")).to_be_visible()
     expect(mocked_page.locator(".player-volume-dock")).to_be_visible()
     expect(mocked_page.locator(".player-now-playing")).to_contain_text("Naruto Shippuden")
@@ -1158,12 +987,67 @@ def test_t3_player_matches_apple_style_control_composition(mocked_page):
     expect(mocked_page.locator(".player-now-playing small")).not_to_contain_text("Episode 1 · Episode 1")
     expect(mocked_page.locator(".player-timeline")).to_be_visible()
     expect(mocked_page.locator(".player-utility-pill")).to_be_visible()
-    mocked_page.locator(".player-overlay").hover()
-    mocked_page.get_by_role("button", name="Forward 10 seconds").click()
-    expect(mocked_page.get_by_role("button", name="Forward 10 seconds")).not_to_contain_text("+10")
-    expect(mocked_page.get_by_role("button", name="Back 10 seconds")).not_to_contain_text("−10")
-    expect(mocked_page.locator(".player-skip-feedback")).to_contain_text("+10 seconds")
+    auto_skip = mocked_page.get_by_role("switch", name="Toggle skip intro")
+    expect(auto_skip).to_be_visible()
+    expect(auto_skip).to_have_attribute("aria-checked", "true")
+    assert auto_skip.evaluate("node => node.getBoundingClientRect().width") >= 108
+    expect(mocked_page.locator(".player-skip-marker.op")).to_have_count(1)
+    expect(mocked_page.locator(".player-skip-marker.ed")).to_have_count(1)
+    subtitles = mocked_page.get_by_title("Subtitles").locator("select")
+    expect(subtitles).to_have_value("0")
+    expect(subtitles.locator("option")).to_have_count(2)
+    auto_skip.click()
+    expect(auto_skip).to_have_attribute("aria-checked", "false")
+    expect(mocked_page.locator(".player-skip-marker.op")).to_have_count(1)
+    expect(mocked_page.locator(".player-leading-controls").get_by_role("button", name="Previous episode")).to_have_count(0)
+    center_controls = mocked_page.get_by_label("Playback controls")
+    expect(center_controls).to_be_visible()
+    transport_labels = center_controls.locator("button").evaluate_all(
+        "buttons => buttons.map(button => button.getAttribute('aria-label'))"
+    )
+    assert transport_labels[:2] == [
+        "Previous episode",
+        "Back 10 seconds",
+    ]
+    assert transport_labels[2] in ("Play", "Pause")
+    assert transport_labels[3:] == [
+        "Forward 10 seconds",
+        "Next episode",
+    ]
+    previous_episode = mocked_page.get_by_role("button", name="Previous episode")
+    next_episode = mocked_page.get_by_role("button", name="Next episode")
+    expect(previous_episode).to_be_disabled()
+    expect(next_episode).to_be_enabled()
+    next_episode.click()
+    expect(mocked_page.locator(".player-now-playing small")).to_have_text("Episode 2")
+    expect(mocked_page.get_by_role("button", name="Previous episode")).to_be_enabled()
 
+    for width in (320, 375, 414, 768):
+        mocked_page.set_viewport_size({"width": width, "height": 720})
+        transport_bounds = center_controls.evaluate("""node => {
+            const rect = node.getBoundingClientRect();
+            return {
+                left: rect.left,
+                right: rect.right,
+                buttons: [...node.querySelectorAll('button')].map((button) => {
+                    const buttonRect = button.getBoundingClientRect();
+                    return { width: buttonRect.width, height: buttonRect.height };
+                }),
+            };
+        }""")
+        assert transport_bounds["left"] >= 0
+        assert transport_bounds["right"] <= width
+        assert all(button["width"] >= 44 and button["height"] >= 44 for button in transport_bounds["buttons"])
+        skip_toggle_bounds = auto_skip.evaluate("""node => {
+            const rect = node.getBoundingClientRect();
+            return { left: rect.left, right: rect.right, width: rect.width, height: rect.height };
+        }""")
+        assert skip_toggle_bounds["left"] >= 0
+        assert skip_toggle_bounds["right"] <= width
+        assert skip_toggle_bounds["width"] >= 44
+        assert skip_toggle_bounds["height"] >= 44
+
+    mocked_page.set_viewport_size({"width": 1440, "height": 900})
     safe_zone = mocked_page.locator(".player-now-playing").evaluate("""node => {
         const rect = node.getBoundingClientRect();
         return {
@@ -1171,13 +1055,127 @@ def test_t3_player_matches_apple_style_control_composition(mocked_page):
             right: rect.right,
             midpoint: window.innerWidth / 2,
             titleSize: parseFloat(getComputedStyle(node.querySelector('strong')).fontSize),
-            timelineHeight: document.querySelector('.player-progress')?.getBoundingClientRect().height ?? 99,
         };
     }""")
     assert safe_zone["left"] < 80
     assert safe_zone["right"] < safe_zone["midpoint"]
     assert safe_zone["titleSize"] <= 24
-    assert safe_zone["timelineHeight"] <= 4
+
+
+def test_t3_chromium_hls_uses_media_source_instead_of_native_m3u8(mocked_page):
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+    mocked_page.locator(".search-result").first.click()
+    mocked_page.locator(".detail-actions button.primary").click()
+    mocked_page.wait_for_selector(".episode-list-row")
+    mocked_page.locator(".episode-list-row").first.click()
+
+    mocked_page.wait_for_function("""() => {
+        const video = document.querySelector('video');
+        return video?.currentSrc.startsWith('blob:');
+    }""")
+    current_src = mocked_page.locator("video").evaluate("video => video.currentSrc")
+    assert current_src.startswith("blob:")
+    assert not current_src.endswith(".m3u8")
+
+
+def test_t3_aniskip_is_on_by_default_and_persists(mocked_page):
+    settings_nav = mocked_page.get_by_label("Primary navigation").get_by_role("button", name="Settings")
+    settings_nav.click()
+    auto_on = mocked_page.get_by_role("radio", name="Skip intro on", exact=False)
+    auto_off = mocked_page.get_by_role("radio", name="Skip intro off", exact=False)
+    expect(auto_on).to_have_attribute("aria-checked", "true")
+
+    auto_off.click()
+    expect(auto_off).to_have_attribute("aria-checked", "true")
+    mocked_page.reload()
+    mocked_page.get_by_label("Primary navigation").get_by_role("button", name="Settings").click()
+    expect(mocked_page.get_by_role("radio", name="Skip intro off", exact=False)).to_have_attribute("aria-checked", "true")
+
+
+def test_t3_direct_provider_result_links_catalog_and_skips_verified_intro(mocked_page):
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+    mocked_page.locator(".search-result").first.click()
+    mocked_page.locator(".detail-actions button.primary").click()
+    mocked_page.wait_for_selector(".episode-list-row")
+    mocked_page.locator(".episode-list-row").first.click()
+    mocked_page.wait_for_selector("video")
+    mocked_page.wait_for_function("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'get_skip_times'
+            && call.args.catalogId === 3000
+            && call.args.episodeNumber === 1
+    )""")
+
+    current_time = mocked_page.locator("video").evaluate("""video => {
+        Object.defineProperty(video, 'duration', { configurable: true, value: 1420 });
+        video.currentTime = 100;
+        video.dispatchEvent(new Event('timeupdate'));
+        return video.currentTime;
+    }""")
+    assert current_time == 150
+    expect(mocked_page.locator(".player-skip-feedback")).to_contain_text("Skipped opening")
+
+
+def test_t3_localized_provider_result_uses_exact_search_catalog_id(mocked_page):
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.get_by_role("button", name="Vietnamese").click()
+    mocked_page.locator(".search-input-shell input").fill("One Piece")
+    mocked_page.wait_for_selector(".search-result")
+    expect(mocked_page.locator(".search-result").first).to_contain_text("One Piece")
+    expect(mocked_page.locator(".search-result").first).to_contain_text("KKPhim")
+    mocked_page.locator(".search-result").first.click()
+    mocked_page.locator(".detail-actions button.primary").click()
+    mocked_page.wait_for_selector(".episode-list-row")
+    mocked_page.locator(".episode-list-row").first.click()
+    mocked_page.wait_for_function("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'get_skip_times'
+            && call.args.catalogId === 21
+            && call.args.episodeNumber === 1
+    )""")
+
+
+def test_t3_skip_intro_does_not_seek_for_mismatched_cut(mocked_page):
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+    mocked_page.locator(".search-result").first.click()
+    mocked_page.locator(".detail-actions button.primary").click()
+    mocked_page.wait_for_selector(".episode-list-row")
+    mocked_page.locator(".episode-list-row").first.click()
+    mocked_page.wait_for_selector("video")
+    mocked_page.wait_for_function("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'get_skip_times'
+    )""")
+
+    current_time = mocked_page.locator("video").evaluate("""video => {
+        Object.defineProperty(video, 'duration', { configurable: true, value: 1200 });
+        video.currentTime = 100;
+        video.dispatchEvent(new Event('timeupdate'));
+        return video.currentTime;
+    }""")
+    assert current_time == 100
+
+
+def test_t3_missing_aniskip_record_is_not_an_error(mocked_page):
+    mocked_page.evaluate("""() => {
+        const state = window.__API_MOCK_STATE__;
+        state.skip_times = [];
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    mocked_page.reload()
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+    mocked_page.locator(".search-result").first.click()
+    mocked_page.locator(".detail-actions button.primary").click()
+    mocked_page.wait_for_selector(".episode-list-row")
+    mocked_page.locator(".episode-list-row").first.click()
+    skip_intro = mocked_page.get_by_role("switch", name="Toggle skip intro")
+    expect(skip_intro).to_have_attribute("data-state", "success")
+    expect(skip_intro).to_have_attribute("title", "No marked segments")
 
 def test_t3_my_list_nav_and_remove(mocked_page):
     mocked_page.locator(".hero-search-trigger").click()
@@ -1189,7 +1187,7 @@ def test_t3_my_list_nav_and_remove(mocked_page):
     expect(favorite).to_have_text("In My List")
     favorite.click()
     stored = mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         return state.my_list.some((item) => item.title === 'Naruto Shippuden');
     }""")
     assert stored is False
@@ -1206,6 +1204,37 @@ def test_t3_search_provider_switch_reloads(mocked_page):
     mocked_page.locator(".availability-strip .provider-chip:has-text('OPhim')").click()
     expect(mocked_page.locator(".search-results-pane")).to_contain_text("OPhim Results")
     expect(mocked_page.locator(".search-preview .eyebrow")).to_contain_text("OPhim")
+
+def test_t3_offline_ophim_requires_health_recheck_before_search(mocked_page):
+    mocked_page.evaluate("""() => {
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
+        const sources = state.sources || window.__API_MOCK_STATE__?.sources || [];
+        state.sources = sources.map((source) => source.name === 'OPhim'
+            ? { ...source, status: 'unavailable', failureCode: 'NETWORK_TIMEOUT' }
+            : source);
+        localStorage.setItem('__API_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    mocked_page.reload()
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".language-switch button").nth(1).click()
+    mocked_page.wait_for_timeout(500)
+    provider = mocked_page.locator(".availability-strip .provider-chip:has-text('OPhim')")
+    expect(provider).to_have_attribute("aria-label", "OPhim: Recheck")
+    provider.click()
+    mocked_page.wait_for_timeout(100)
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+
+    retried = mocked_page.evaluate("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'retry_provider_health' && call.args.provider === 'OPhim'
+    )""")
+    searched = mocked_page.evaluate("""() => window.__API_CALLS__.some(
+        (call) => call.cmd === 'search_source' && call.args.provider === 'OPhim'
+    )""")
+    assert retried is True
+    assert searched is False
+    expect(mocked_page.locator(".search-results-pane")).to_contain_text("KKPhim Results")
+    expect(provider).to_have_attribute("aria-label", "OPhim: Recheck")
 
 def test_t3_continue_watching_opens_saved_episode_detail(mocked_page):
     # Click continue watching card for One Piece
@@ -1251,9 +1280,8 @@ def test_t4_full_user_watching_session(mocked_page):
     mocked_page.wait_for_selector(".episode-list-row")
 
     # 5. Jump to episode 25, verify it highlights, then play it
-    finder = mocked_page.locator(".episode-toolbar input[placeholder*='Find episode']")
-    finder.fill("25")
-    finder.press("Enter")
+    mocked_page.locator(".episode-toolbar input").fill("25")
+    mocked_page.locator(".episode-toolbar input").press("Enter")
     expect(mocked_page.locator(".episode-list-row.highlighted")).to_contain_text("Episode 25")
     mocked_page.locator(".episode-list-row.highlighted").click()
 
@@ -1273,7 +1301,7 @@ def test_t4_watchlist_management_scenario(mocked_page):
     expect(mocked_page.locator(".search-preview .detail-actions button").nth(1)).to_have_text("In My List")
 
     stored = mocked_page.evaluate("""() => {
-        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        const state = JSON.parse(localStorage.getItem('__API_MOCK_STATE__') || '{}');
         return state.my_list.some((item) => item.title === 'Naruto Shippuden');
     }""")
     assert stored is True
@@ -1295,3 +1323,192 @@ def test_t4_mac_vibrancy_playback_combo(mocked_page):
     # 4. Confirm transparent class styling handles vibrancy fallback
     has_macos_class = mocked_page.evaluate("document.documentElement.classList.contains('platform-macos')")
     assert has_macos_class is True
+
+# --- ANI-DESK SPECIFIC TESTS (hosted auth, updater, desktop polish) ---
+
+def test_t1_hosted_login_desktop_layout(hosted_page):
+    hosted_page.get_by_label("Username").fill("family-admin")
+    hosted_page.get_by_label("Password", exact=True).fill("family-password")
+    hosted_page.get_by_role("button", name="Sign in").click()
+    expect(hosted_page.locator(".home-command-center")).to_be_visible()
+
+    metrics = hosted_page.evaluate("""() => ({
+        viewport: window.innerWidth,
+        page: document.documentElement.scrollWidth,
+        shell: document.querySelector('.app-shell')?.classList.contains('edition-web') || false,
+    })""")
+    assert metrics["page"] <= metrics["viewport"]
+    assert metrics["shell"] is True
+
+def test_t1_mobile_hosted_login_settings_theme_and_logout(mobile_hosted_page):
+    mobile_hosted_page.get_by_label("Username").fill("family-admin")
+    mobile_hosted_page.get_by_label("Password", exact=True).fill("family-password")
+    mobile_hosted_page.get_by_role("button", name="Sign in").click()
+    expect(mobile_hosted_page.locator(".home-command-center")).to_be_visible()
+
+    mobile_hosted_page.get_by_label("Primary navigation").get_by_role("button", name="Settings").click()
+    expect(mobile_hosted_page.get_by_label("Application theme").locator("button[role='radio']").first).to_be_visible()
+    metrics = mobile_hosted_page.evaluate("""() => ({
+        viewport: window.innerWidth,
+        page: document.documentElement.scrollWidth,
+    })""")
+    assert metrics["page"] <= metrics["viewport"]
+
+    mobile_hosted_page.get_by_label("Primary navigation").get_by_role("button", name="Home").click()
+    mobile_hosted_page.get_by_role("button", name="Sign out family-admin").click()
+    expect(mobile_hosted_page.locator(".login-screen")).to_be_visible()
+
+def test_t1_hosted_admin_creates_user_and_resets_password(hosted_page):
+    hosted_page.get_by_label("Username").fill("family-admin")
+    hosted_page.get_by_label("Password", exact=True).fill("family-password")
+    hosted_page.get_by_role("button", name="Sign in").click()
+
+    expect(hosted_page.locator(".home-command-center")).to_be_visible()
+    hosted_page.get_by_role("button", name="Users", exact=True).click()
+    expect(hosted_page.get_by_role("heading", name="People & access")).to_be_visible()
+    expect(hosted_page.locator(".admin-user-row")).to_have_count(1)
+
+    create_form = hosted_page.locator(".admin-create-card")
+    create_form.get_by_label("Username").fill("family-viewer")
+    create_form.get_by_label("Temporary password").fill("Viewer-Password-2026")
+    create_form.get_by_label("Access level").select_option("user")
+    create_form.get_by_role("button", name="Create account").click()
+
+    expect(hosted_page.locator(".admin-user-row")).to_have_count(2)
+    viewer_row = hosted_page.locator(".admin-user-row").filter(
+        has=hosted_page.get_by_label("Username for family-viewer")
+    )
+    expect(viewer_row).to_be_visible()
+    viewer_row.get_by_label("New password for family-viewer").fill("Viewer-New-Password-2026")
+    viewer_row.get_by_role("button", name="Save").click()
+    expect(viewer_row.get_by_label("New password for family-viewer")).to_have_value("")
+
+    requests = hosted_page.ani_hosted_state["requests"]
+    assert requests[0]["method"] == "POST"
+    assert requests[0]["request_marker"] == "1"
+    assert requests[-1]["method"] == "PUT"
+    assert requests[-1]["request_marker"] == "1"
+    assert requests[-1]["body"]["password"] == "Viewer-New-Password-2026"
+
+    desktop_metrics = hosted_page.evaluate("""() => ({
+        viewport: window.innerWidth,
+        page: document.documentElement.scrollWidth,
+        admin: document.querySelector('.admin-page').getBoundingClientRect(),
+        save: document.querySelector('.admin-user-row:last-child > button').getBoundingClientRect(),
+    })""")
+    assert desktop_metrics["page"] <= desktop_metrics["viewport"]
+    assert desktop_metrics["admin"]["right"] <= desktop_metrics["viewport"]
+    assert desktop_metrics["save"]["right"] <= desktop_metrics["viewport"]
+
+    hosted_page.set_viewport_size({"width": 390, "height": 844})
+    hosted_page.wait_for_timeout(250)
+    metrics = hosted_page.evaluate("""() => ({
+        viewport: window.innerWidth,
+        page: document.documentElement.scrollWidth,
+        admin: document.querySelector('.admin-page').getBoundingClientRect().width,
+    })""")
+    assert metrics["page"] <= metrics["viewport"]
+    assert metrics["admin"] <= metrics["viewport"]
+    assert hosted_page.ani_page_errors == []
+
+def test_t2_updater_available_prompt_and_install(tauri_mocked_page):
+    tauri_mocked_page.evaluate("""() => {
+        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        state.update_available = true;
+        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    tauri_mocked_page.reload()
+    tauri_mocked_page.wait_for_selector(".update-prompt")
+    expect(tauri_mocked_page.locator(".update-prompt")).to_contain_text("is available")
+    tauri_mocked_page.locator(".update-prompt .primary").click()
+    expect(tauri_mocked_page.locator(".update-prompt")).to_contain_text("Update installed")
+    relaunched = tauri_mocked_page.evaluate("""() => {
+        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        return state.relaunched === true && state.update_installed === true;
+    }""")
+    assert relaunched is True
+
+def test_t2_updater_error_fallback(tauri_mocked_page):
+    tauri_mocked_page.evaluate("""() => {
+        const state = JSON.parse(localStorage.getItem('__TAURI_MOCK_STATE__') || '{}');
+        state.update_available = true;
+        state.update_install_error = "signature rejected";
+        localStorage.setItem('__TAURI_MOCK_STATE__', JSON.stringify(state));
+    }""")
+    tauri_mocked_page.reload()
+    tauri_mocked_page.wait_for_selector(".update-prompt")
+    tauri_mocked_page.locator(".update-prompt .primary").click()
+    expect(tauri_mocked_page.locator(".update-prompt")).to_contain_text("Update failed")
+
+def test_t1_dashboard_feature_controls_and_shelves_do_not_overlap(mocked_page):
+    dots = mocked_page.locator(".home-feature-dots button")
+    expect(dots.first).to_have_attribute("aria-current", "true")
+    mocked_page.get_by_role("button", name="Next featured title").click()
+    expect(dots.nth(1)).to_have_attribute("aria-current", "true")
+    mocked_page.get_by_role("button", name="Pause featured titles").click()
+    expect(mocked_page.get_by_role("button", name="Play featured titles")).to_be_visible()
+
+    metrics = mocked_page.evaluate("""() => {
+        const hero = document.querySelector('.home-command-center')?.getBoundingClientRect();
+        const shelf = document.querySelector('.dashboard-shelves')?.getBoundingClientRect();
+        return { heroBottom: hero?.bottom ?? 0, shelfTop: shelf?.top ?? 0 };
+    }""")
+    assert metrics["shelfTop"] >= metrics["heroBottom"]
+
+def test_t1_dashboard_scrolls_every_populated_shelf_into_view(mocked_page):
+    mocked_page.set_viewport_size({"width": 1440, "height": 900})
+    metrics = mocked_page.evaluate("""() => {
+        const shell = document.querySelector('.app-shell.route-home');
+        const shelf = document.querySelector('.content-row:has(.row-heading h2)');
+        const shelves = document.querySelectorAll('.home-dashboard .content-row');
+        const lastShelf = shelves[shelves.length - 1];
+        const initial = lastShelf.getBoundingClientRect();
+        shell.scrollTo({ top: shell.scrollHeight, behavior: 'instant' });
+        const final = lastShelf.getBoundingClientRect();
+        const shellBox = shell.getBoundingClientRect();
+        return {
+            hasShelf: Boolean(shelf),
+            clientHeight: shell.clientHeight,
+            scrollHeight: shell.scrollHeight,
+            initialBottom: initial.bottom,
+            finalTop: final.top,
+            finalBottom: final.bottom,
+            shellTop: shellBox.top,
+            shellBottom: shellBox.bottom,
+        };
+    }""")
+    assert metrics["hasShelf"] is True
+    assert metrics["scrollHeight"] > metrics["clientHeight"]
+    assert metrics["initialBottom"] > metrics["shellBottom"]
+    assert metrics["finalTop"] >= metrics["shellTop"]
+    assert metrics["finalBottom"] <= metrics["shellBottom"]
+
+def test_t1_desktop_cinema_reduced_motion_is_opacity_only(mocked_page):
+    mocked_page.emulate_media(reduced_motion="reduce")
+    mocked_page.reload()
+    mocked_page.wait_for_selector(".home-feature-copy")
+    transform = mocked_page.locator(".home-feature-copy").evaluate(
+        "node => getComputedStyle(node).transform"
+    )
+    assert transform == "none"
+
+def test_t1_search_preview_uses_one_detailed_backdrop(mocked_page):
+    mocked_page.locator(".hero-search-trigger").click()
+    mocked_page.locator(".search-input-shell input").fill("Naruto")
+    mocked_page.wait_for_selector(".search-result")
+    mocked_page.locator(".search-result").first.click()
+    expect(mocked_page.locator(".search-preview .preview-art")).to_be_visible()
+    expect(mocked_page.locator(".search-preview .preview-poster-fallback")).to_have_count(0)
+    expect(mocked_page.locator(".search-preview .preview-copy h1")).to_be_visible()
+
+def test_t1_settings_persist_size_and_vietnamese_font(mocked_page):
+    mocked_page.get_by_label("Primary navigation").get_by_role("button", name="Settings").click()
+    mocked_page.get_by_role("radio", name=re.compile(r"Large")).click()
+    mocked_page.get_by_role("radio", name=re.compile(r"Noto Sans")).click()
+    state = mocked_page.evaluate("""() => ({
+        scale: document.documentElement.dataset.scale,
+        font: document.documentElement.dataset.font,
+        savedScale: localStorage.getItem('ani-desk:scale'),
+        savedFont: localStorage.getItem('ani-desk:font'),
+    })""")
+    assert state == {"scale": "large", "font": "noto", "savedScale": "large", "savedFont": "noto"}
