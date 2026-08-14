@@ -479,6 +479,7 @@ mod tests {
             subtitles: Vec::new(),
             qualities: Vec::new(),
             headers: HashMap::new(),
+            use_curl: false,
         };
         assert!(!requires_insecure_tls(&normal));
 

@@ -17,8 +17,14 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourcesConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub allanime: bool,
+
+    #[serde(default = "default_true")]
+    pub anidb: bool,
+
+    #[serde(default = "default_true")]
+    pub anizone: bool,
 
     #[serde(default = "default_true")]
     pub animegg: bool,
@@ -32,13 +38,13 @@ pub struct SourcesConfig {
     #[serde(default = "default_true")]
     pub ophim: bool,
 
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub animevietsub: bool,
 
     #[serde(default)]
     pub animetvn: bool,
 
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub niniyo: bool,
 
     #[serde(default)]
@@ -71,14 +77,22 @@ fn default_theme() -> ThemeConfig {
 impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
-            allanime: true,
+            anidb: true,
+            anizone: true,
+            // AllAnime remains disabled: its current source API is
+            // challenge-gated and cannot pass playback certification.
+            allanime: false,
+            // AnimeGG passes live playback certification and is enabled.
             animegg: true,
+            // MovieBox passes live playback certification and is enabled.
             moviebox: true,
             kkphim: true,
             ophim: true,
+            // AnimeVietSub remains an opt-in OPhim-backed compatibility
+            // adapter until a distinct web-safe integration is certified.
             animevietsub: false,
             animetvn: false,
-            niniyo: false,
+            niniyo: true,
             hianime: false,
         }
     }
@@ -152,5 +166,46 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Config validation - all providers now work without external dependencies
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn omitted_uncertified_sources_remain_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+                [sources]
+                moviebox = true
+            "#,
+        )
+        .expect("config should parse");
+
+        assert!(!config.sources.allanime);
+        assert!(config.sources.anidb);
+        assert!(config.sources.animegg);
+        assert!(!config.sources.animevietsub);
+        assert!(!config.sources.animetvn);
+        assert!(!config.sources.hianime);
+        assert!(config.sources.anizone);
+    }
+
+    #[test]
+    fn defaults_enable_only_browser_certified_sources() {
+        let sources = super::SourcesConfig::default();
+
+        assert!(sources.kkphim);
+        assert!(sources.ophim);
+        assert!(sources.niniyo);
+        assert!(sources.anizone);
+        assert!(sources.anidb);
+        assert!(sources.moviebox);
+        assert!(sources.animegg);
+        assert!(!sources.allanime);
+        assert!(!sources.animevietsub);
+        assert!(!sources.animetvn);
+        assert!(!sources.hianime);
     }
 }
