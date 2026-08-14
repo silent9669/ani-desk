@@ -6,7 +6,6 @@ export type Source = {
   failureCode?: string | null;
   capabilities: ProviderCapabilities;
   websiteUrl?: string | null;
-  verificationUrl?: string | null;
 };
 
 export type ProviderCapabilities = {
@@ -21,6 +20,7 @@ export type CatalogAnime = {
   catalogId: number;
   title: string;
   nativeTitle?: string | null;
+  synonyms?: string[];
   description?: string | null;
   coverUrl: string;
   bannerUrl?: string | null;
@@ -113,6 +113,7 @@ export type AnimeDetails = {
 export type Episode = {
   id: string;
   number: number;
+  aniskipEpisodeNumber?: number | null;
   title?: string | null;
   thumbnail?: string | null;
 };
@@ -146,6 +147,13 @@ export type Playback = {
   subtitles: Array<{ language: string; url: string }>;
   qualities: string[];
   canFallbackToMpv: boolean;
+};
+
+export type SkipTime = {
+  skipType: "op" | "ed" | "recap" | string;
+  startTime: number;
+  endTime: number;
+  episodeLength?: number | null;
 };
 
 export type DownloadEvent = {

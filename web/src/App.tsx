@@ -9,6 +9,8 @@ import {
   Clock,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   Film,
   FolderOpen,
   HardDrive,
@@ -20,6 +22,8 @@ import {
   PictureInPicture2,
   Play,
   Plus,
+  RotateCcw,
+  RotateCw,
   Search,
   Settings2,
   ShieldCheck,
@@ -54,6 +58,7 @@ import type {
   ManagedUser,
   PlayerContext,
   ProviderAvailability,
+  SkipTime,
   Source,
   SessionUser,
   WatchHistory,
@@ -69,6 +74,7 @@ const SOURCE_STORAGE_KEY = "ani-desk:selected-source";
 const THEME_STORAGE_KEY = "ani-desk:theme";
 const APP_SCALE_STORAGE_KEY = "ani-desk:scale";
 const APP_FONT_STORAGE_KEY = "ani-desk:font";
+const SKIP_INTRO_STORAGE_KEY = "ani-desk:skip-intro";
 const EPISODE_RANGE_SIZE = 50;
 const LOGO_SRC = "/logo.png";
 const fadeUpVariant = {
@@ -77,14 +83,14 @@ const fadeUpVariant = {
 };
 
 type Route = "home" | "my-list" | "continue" | "downloads" | "admin" | "search" | "detail" | "catalog" | "settings";
-type AppTheme = "obsidian" | "oled" | "system";
-type AppScale = "compact" | "comfortable" | "large";
+type AppTheme = "obsidian" | "oled" | "ember" | "crimson" | "system";
+type AppScale = "compact" | "comfortable" | "large" | "tv";
 type AppFont = "manrope" | "noto" | "system";
 type QualityLevel = { index: number; label: string; id?: string };
 type ShelfSort = "recent" | "title" | "provider";
 type HomeFeatureSlide = {
   id: string;
-  kind: "trending";
+  kind: "personalMatch";
   title: string;
   image: string;
   description: string;
@@ -129,10 +135,11 @@ function App() {
   const catalogSearchGenerationRef = useRef(0);
   const pendingUpdateRef = useRef<Update | null>(null);
   const [appUpdate, setAppUpdate] = useState<AppUpdateState>({ status: "idle" });
-  const [providerAccessPending, setProviderAccessPending] = useState<string | null>(null);
+  const [providerHealthPending, setProviderHealthPending] = useState<string | null>(null);
   const [theme, setTheme] = useState<AppTheme>(loadSavedTheme);
   const [appScale, setAppScale] = useState<AppScale>(loadSavedScale);
   const [appFont, setAppFont] = useState<AppFont>(loadSavedFont);
+  const [autoSkip, setAutoSkip] = useState(loadSavedAutoSkip);
 
   useEffect(() => {
     void bootstrap();
@@ -154,6 +161,10 @@ function App() {
   }, [appFont]);
 
   useEffect(() => {
+    saveAutoSkip(autoSkip);
+  }, [autoSkip]);
+
+  useEffect(() => {
     if (bootstrapping || !isTauriRuntime()) return;
     const handle = window.setTimeout(() => {
       void checkAppUpdates();
@@ -167,7 +178,77 @@ function App() {
     root.classList.toggle("platform-macos", userAgent.includes("mac"));
     root.classList.toggle("platform-windows", userAgent.includes("win"));
     root.classList.toggle("platform-linux", userAgent.includes("linux"));
+
+    const tvUserAgent = /(smart-tv|smarttv|tizen|web0s|webos|netcast|hbbtv|googletv|android tv|aft[bmst]|crkey)/.test(userAgent);
+    const updateTvPlatform = () => {
+      const remoteViewport = window.matchMedia("(min-width: 80rem) and (min-height: 40rem) and (hover: none)").matches;
+      root.classList.toggle("platform-tv", tvUserAgent || remoteViewport);
+    };
+    updateTvPlatform();
+    window.addEventListener("resize", updateTvPlatform);
+    return () => window.removeEventListener("resize", updateTvPlatform);
   }, []);
+
+  useEffect(() => {
+    const handleTvNavigation = (event: KeyboardEvent) => {
+      if (player || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      const root = document.documentElement;
+      if (!root.classList.contains("platform-tv") && root.dataset.scale !== "tv") return;
+
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      if (active?.matches("input, textarea, select, [contenteditable='true']")) return;
+
+      const focusable = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          "button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])",
+        ),
+      ).filter((element) => {
+        const bounds = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return bounds.width > 0 && bounds.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      });
+      if (!focusable.length) return;
+
+      if (!active || !focusable.includes(active)) {
+        event.preventDefault();
+        const preferred = focusable.find((element) => element.matches(".app-navigation-items > button.active")) ?? focusable[0];
+        preferred.focus({ preventScroll: true });
+        preferred.scrollIntoView({ block: "nearest", inline: "nearest" });
+        return;
+      }
+
+      const current = active.getBoundingClientRect();
+      const currentX = current.left + current.width / 2;
+      const currentY = current.top + current.height / 2;
+      const vertical = event.key === "ArrowUp" || event.key === "ArrowDown";
+      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+      let next: HTMLElement | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
+
+      for (const candidate of focusable) {
+        if (candidate === active) continue;
+        const bounds = candidate.getBoundingClientRect();
+        const deltaX = bounds.left + bounds.width / 2 - currentX;
+        const deltaY = bounds.top + bounds.height / 2 - currentY;
+        const primary = vertical ? deltaY : deltaX;
+        if ((forward && primary <= 4) || (!forward && primary >= -4)) continue;
+        const secondary = vertical ? deltaX : deltaY;
+        const score = Math.abs(primary) + Math.abs(secondary) * 2.4;
+        if (score < bestScore) {
+          next = candidate;
+          bestScore = score;
+        }
+      }
+
+      if (!next) return;
+      event.preventDefault();
+      next.focus({ preventScroll: true });
+      next.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    };
+
+    window.addEventListener("keydown", handleTvNavigation);
+    return () => window.removeEventListener("keydown", handleTvNavigation);
+  }, [player, route]);
 
   useEffect(() => {
     if (route !== "search") return;
@@ -190,9 +271,17 @@ function App() {
   useEffect(() => {
     if (!sources.length) return;
     const current = selectedSource;
-    if (current?.languageGroup === languageGroup) return;
+    if (
+      current?.languageGroup === languageGroup
+      && current.status === "healthy"
+      && current.capabilities.search
+    ) return;
     const nextSource = firstSearchableSource(sources, languageGroup);
-    if (nextSource) selectSource(nextSource);
+    if (nextSource) {
+      selectSource(nextSource);
+    } else {
+      setSelectedSource(null);
+    }
   }, [sources, languageGroup, selectedSource?.name]);
 
   useEffect(() => {
@@ -212,7 +301,13 @@ function App() {
         api.listDownloads(500),
       ]);
       const savedSourceName = loadSavedSourceName();
-      const nextSource = sourceList.find((source) => source.name === savedSourceName) ?? sourceList[0] ?? null;
+      const savedSource = sourceList.find((source) =>
+        source.name === savedSourceName
+        && source.languageGroup === languageGroup
+        && source.status === "healthy"
+        && source.capabilities.search
+      );
+      const nextSource = savedSource ?? firstSearchableSource(sourceList, languageGroup);
 
       setSources(sourceList);
       setSelectedSource(nextSource);
@@ -222,8 +317,20 @@ function App() {
       setDownloads(downloadLibrary);
       void api.listProviderHealth().then((health) => {
         setSources(health);
-        setSelectedSource((current) => health.find((source) => source.name === current?.name) ?? health[0] ?? null);
-      }).catch((err) => setError(toAppError(err, "provider-health")));
+        setSelectedSource((current) => {
+          const selected = health.find((source) => source.name === current?.name && source.status === "healthy");
+          return selected ?? firstSearchableSource(health, languageGroup) ?? null;
+        });
+      }).catch((err) => {
+        const appError = toAppError(err, "provider-health");
+        setSources((current) => current.map((source) => source.status === "unknown" ? {
+          ...source,
+          status: "unavailable",
+          failureCode: appError.code,
+        } : source));
+        setSelectedSource(null);
+        setError(appError);
+      });
       void api.getDiscovery().then((catalog) => {
         setDiscovery(catalog);
       }).catch((err) => setError(toAppError(err, "catalog")));
@@ -400,9 +507,15 @@ function App() {
       if (catalogOutcome.ok) {
         const items = catalogOutcome.items;
         setCatalogResults(items);
-        if (directItems.length) {
+        const linkedDirectItems = directItems.map((anime, index) => {
+          const catalogMatch = exactCatalogMatch(items, anime)
+            ?? (index === 0 ? exactCatalogTitleMatch(items, cleanQuery) : null);
+          return catalogMatch ? catalogToAnime(catalogMatch, anime) : anime;
+        });
+        setProviderResults(linkedDirectItems);
+        if (linkedDirectItems.length) {
           setCatalogSelection(null);
-          setSearchSelection(directItems[0]);
+          setSearchSelection(linkedDirectItems[0]);
         } else {
           setCatalogSelection(null);
         }
@@ -476,42 +589,18 @@ function App() {
       .slice(0, 36);
   }
 
-  async function openProviderAccess(source: Source) {
-    setProviderAccessPending(`open:${source.name}`);
-    try {
-      await api.openProviderAccess(source.name);
-    } catch (err) {
-      setError(toAppError(err, "provider-access"));
-    } finally {
-      setProviderAccessPending(null);
-    }
-  }
-
-  async function completeProviderVerification(source: Source) {
-    setProviderAccessPending(`retry:${source.name}`);
-    try {
-      const health = await api.completeProviderVerification(source.name);
-      const verified = health.find((item) => item.name === source.name);
-      setSources((current) => current.map((item) => health.find((update) => update.name === item.name) ?? item));
-      if (verified) setSelectedSource(verified);
-      if (verified?.status === "healthy" && query.trim().length >= 2) {
-        await searchCatalog(query, verified);
-      }
-    } catch (err) {
-      setError(toAppError(err, "provider-verification"));
-    } finally {
-      setProviderAccessPending(null);
-    }
-  }
-
-  function selectProviderResult(anime: Anime) {
+  async function selectProviderResult(anime: Anime) {
+    const catalogMatch = anime.catalogId
+      ? catalogResults.find((item) => item.catalogId === anime.catalogId) ?? null
+      : exactCatalogMatch(catalogResults, anime);
     setCatalogSelection(null);
     setAvailability([]);
     setSelectedSource(sources.find((source) => source.name === anime.provider) ?? null);
-    setSearchSelection(anime);
+    setSearchSelection(catalogMatch ? catalogToAnime(catalogMatch, anime) : anime);
   }
 
   function selectProviderSource(source: Source) {
+    if (source.status !== "healthy") return;
     selectSource(source);
     const direct = providerResults.find((anime) => anime.provider === source.name);
     if (direct) {
@@ -529,13 +618,42 @@ function App() {
     if (query.trim().length >= 2) void searchCatalog(query, source);
   }
 
+  async function retryProviderHealth(source: Source) {
+    setProviderHealthPending(source.name);
+    setError(null);
+    try {
+      const updates = await api.retryProviderHealth(source.name);
+      const update = updates.find((item) => item.name === source.name);
+      if (!update) return;
+      setSources((current) => current.map((item) => item.name === update.name ? update : item));
+      if (update.status === "healthy") {
+        selectProviderSource(update);
+      }
+    } catch (err) {
+      const appError = toAppError(err, "provider-health");
+      setSources((current) => current.map((item) => item.name === source.name ? {
+        ...item,
+        status: "unavailable",
+        failureCode: appError.code,
+      } : item));
+      setError(appError);
+    } finally {
+      setProviderHealthPending(null);
+    }
+  }
+
   function selectSearchLanguage(group: "english" | "vietnamese") {
     setLanguageGroup(group);
     const nextSource = firstSearchableSource(sources, group);
     if (nextSource) {
       selectSource(nextSource);
-      if (query.trim().length >= 2) void searchCatalog(query, nextSource);
+    } else {
+      setSelectedSource(null);
     }
+    setProviderResults([]);
+    setSearchSelection(null);
+    setAvailability([]);
+    if (query.trim().length >= 2) void searchCatalog(query, nextSource);
   }
 
   function selectCatalogResult(anime: CatalogAnime) {
@@ -564,7 +682,11 @@ function App() {
       if (generation !== availabilityGenerationRef.current) return;
       availabilityCacheRef.current.set(cacheKey, { expiresAt: Date.now() + 5 * 60_000, items: options });
       setAvailability(options);
-      const playable = options.find((item) => item.status === "available" && item.anime)?.anime ?? null;
+      const playable = options.find((item) =>
+        item.status === "available"
+        && item.anime
+        && sources.some((source) => source.name === item.provider && source.status === "healthy")
+      )?.anime ?? null;
       setSearchSelection(playable ? catalogToAnime(catalog, playable) : null);
       setSelectedSource(playable ? sources.find((source) => source.name === playable.provider) ?? null : null);
     } catch (err) {
@@ -579,7 +701,9 @@ function App() {
 
   async function selectCatalogProvider(option: ProviderAvailability) {
     if (!catalogSelection || !option.anime) return;
-    setSelectedSource(sources.find((source) => source.name === option.provider) ?? null);
+    const source = sources.find((item) => item.name === option.provider);
+    if (!source || source.status !== "healthy") return;
+    setSelectedSource(source);
     setSearchSelection(catalogToAnime(catalogSelection, option.anime));
   }
 
@@ -630,14 +754,26 @@ function App() {
     setLoadingEpisodes(true);
     setError(null);
     if (route !== "detail") navigate("detail");
-    void enrichAnime(anime);
+    const linkedAnime = await linkCatalogAnime(anime);
+    if (linkedAnime !== anime) setSelectedAnime(linkedAnime);
+    void enrichAnime(linkedAnime);
     try {
-      setEpisodes(await api.getEpisodes(anime.provider, anime.id));
+      setEpisodes(await api.getEpisodes(linkedAnime.provider, linkedAnime.id));
     } catch (err) {
-      setError(toAppError(err, "episodes"));
+      const appError = toAppError(err, "episodes");
+      if (providerFailureMakesOffline(appError)) markProviderOffline(anime.provider, appError.code);
+      setError(appError);
     } finally {
       setLoadingEpisodes(false);
     }
+  }
+
+  async function linkCatalogAnime(anime: Anime): Promise<Anime> {
+    if (anime.catalogId) return anime;
+    const outcome = await loadCatalogSearchResults(anime.title);
+    if (!outcome.ok) return anime;
+    const match = exactCatalogMatch(outcome.items, anime);
+    return match ? catalogToAnime(match, anime) : anime;
   }
 
   async function openHistoryItem(item: WatchHistory) {
@@ -706,8 +842,20 @@ function App() {
       const playback = await api.preparePlayback(anime.provider, episode.id);
       setPlayer({ anime, episode, episodes: episodeList, playback, startTime });
     } catch (err) {
-      setError(toAppError(err, "playback"));
+      const appError = toAppError(err, "playback");
+      if (providerFailureMakesOffline(appError)) markProviderOffline(anime.provider, appError.code);
+      setError(appError);
     }
+  }
+
+  function markProviderOffline(provider: string, failureCode: string) {
+    setSources((current) => current.map((source) =>
+      source.name === provider
+        ? { ...source, status: "unavailable", failureCode }
+        : source
+    ));
+    setSelectedSource((current) => current?.name === provider ? null : current);
+    availabilityCacheRef.current.clear();
   }
 
   async function downloadEpisode(anime: Anime, episode: Episode) {
@@ -768,7 +916,7 @@ function App() {
           downloadId: result.id,
           status: "complete",
           progress: 100,
-          message: `Saved to ${result.filePath}`,
+          message: "Browser download started",
           filePath: result.filePath,
           fileName: result.fileName,
         },
@@ -898,6 +1046,7 @@ function App() {
               onOpen={(item) => void openHistoryItem(item)}
               onRemove={(item) => void removeHistoryItem(item)}
               onBack={goBack}
+              onOpenSearch={openSearch}
               myList={myList}
               onToggleFavorite={(item) => toggleMyList(historyToAnime(item, myList))}
             />
@@ -910,6 +1059,7 @@ function App() {
               onOpen={(anime) => void openAnime(anime)}
               onRemove={(anime) => void removeFromMyList(anime)}
               onBack={goBack}
+              onOpenSearch={openSearch}
             />
           )}
 
@@ -936,10 +1086,12 @@ function App() {
               theme={theme}
               appScale={appScale}
               appFont={appFont}
+              autoSkip={autoSkip}
               onBack={goBack}
               onThemeChange={setTheme}
               onScaleChange={setAppScale}
               onFontChange={setAppFont}
+              onAutoSkipChange={setAutoSkip}
             />
           )}
 
@@ -971,9 +1123,8 @@ function App() {
               onLanguageChange={selectSearchLanguage}
               onProviderSelect={(option) => void selectCatalogProvider(option)}
               onProviderSourceSelect={selectProviderSource}
-              onOpenProviderAccess={(source) => void openProviderAccess(source)}
-              onCompleteProviderVerification={(source) => void completeProviderVerification(source)}
-              providerAccessPending={providerAccessPending}
+              onProviderHealthRetry={(source) => void retryProviderHealth(source)}
+              providerHealthPending={providerHealthPending}
               onSelectProviderResult={selectProviderResult}
               onSelectCatalog={selectCatalogResult}
               onOpenAnime={(anime) => void openAnime(anime)}
@@ -1016,6 +1167,9 @@ function App() {
           <VideoPlayer
             key="video-player"
             context={player}
+            autoSkip={autoSkip}
+            onAutoSkipChange={setAutoSkip}
+            onPlayEpisode={(episode) => playEpisode(player.anime, episode, 0, player.episodes)}
             onClose={() => {
               setPlayer(null);
               void refreshShelfData();
@@ -1080,24 +1234,31 @@ function SettingsPage({
   onThemeChange,
   onScaleChange,
   onFontChange,
+  autoSkip,
+  onAutoSkipChange,
 }: {
   theme: AppTheme;
   appScale: AppScale;
   appFont: AppFont;
+  autoSkip: boolean;
   onBack: () => void;
   onThemeChange: (theme: AppTheme) => void;
   onScaleChange: (scale: AppScale) => void;
   onFontChange: (font: AppFont) => void;
+  onAutoSkipChange: (enabled: boolean) => void;
 }) {
   const themes: Array<{ id: AppTheme; name: string; description: string }> = [
     { id: "obsidian", name: "Obsidian Cinema", description: "Warm black, restrained red, full artwork." },
     { id: "oled", name: "OLED Theatre", description: "Deeper surfaces for dark rooms and phones." },
+    { id: "ember", name: "Ember Room", description: "Warm charcoal with a softer vermilion accent." },
+    { id: "crimson", name: "Crimson Noir", description: "Wine-black surfaces with a richer theatrical red." },
     { id: "system", name: "Device Contrast", description: "Follows the device contrast preference." },
   ];
   const scales: Array<{ id: AppScale; name: string; description: string }> = [
     { id: "compact", name: "Compact", description: "More titles and controls on a 16-inch display." },
     { id: "comfortable", name: "Comfortable", description: "Balanced spacing for everyday viewing." },
     { id: "large", name: "Large", description: "Larger text and touch targets for shared screens." },
+    { id: "tv", name: "TV / remote", description: "10-foot text, generous safe margins, and arrow-key focus navigation." },
   ];
   const fonts: Array<{ id: AppFont; name: string; description: string }> = [
     { id: "manrope", name: "Manrope", description: "Modern interface face with Vietnamese support." },
@@ -1107,12 +1268,12 @@ function SettingsPage({
 
   return (
     <motion.section className="settings-page" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-      <header className="settings-header">
+        <header className="settings-header">
         <IconButton label="Back" onClick={onBack}><ArrowLeft size={21} /></IconButton>
         <div>
           <p>Appearance</p>
           <h1>Settings</h1>
-          <span>Choose the theme, interface size, and Vietnamese-compatible reading font for this device.</span>
+          <span>Choose playback behavior, interface size, theme, and reading font for this device.</span>
         </div>
       </header>
 
@@ -1159,6 +1320,22 @@ function SettingsPage({
             ))}
           </div>
         </section>
+
+        <section className="settings-edit-card settings-playback-card">
+          <div className="settings-section-heading">
+            <div><h2>Playback</h2><p>Use AniSkip community timing data to skip known openings.</p></div>
+          </div>
+          <div className="appearance-options" role="radiogroup" aria-label="Skip intro">
+            <button role="radio" aria-checked={autoSkip} className={autoSkip ? "active" : ""} onClick={() => onAutoSkipChange(true)}>
+              <span><strong>Skip intro on</strong><small>Skip a verified opening when playback enters its marked range.</small></span>
+              {autoSkip ? <Check size={17} /> : null}
+            </button>
+            <button role="radio" aria-checked={!autoSkip} className={!autoSkip ? "active" : ""} onClick={() => onAutoSkipChange(false)}>
+              <span><strong>Skip intro off</strong><small>Play openings normally while keeping timing markers visible.</small></span>
+              {!autoSkip ? <Check size={17} /> : null}
+            </button>
+          </div>
+        </section>
       </div>
     </motion.section>
   );
@@ -1167,7 +1344,6 @@ function SettingsPage({
 function providerStatusLabel(source: Source) {
   if (source.status === "healthy") return "Healthy";
   if (source.status === "degraded") return "Limited";
-  if (source.status === "unavailable" && source.verificationUrl) return "Verify";
   if (source.status === "unavailable") return "Offline";
   return "Checking";
 }
@@ -1181,6 +1357,7 @@ function LoginScreen({
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   return (
@@ -1229,11 +1406,32 @@ function LoginScreen({
             <span>Username</span>
             <input autoComplete="username" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={username} onChange={(event) => setUsername(event.target.value)} autoFocus />
           </label>
-          <label>
+          <label className="login-password-label">
             <span>Password</span>
-            <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            <span className="login-password-field">
+              <input
+                type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+              <button
+                type="button"
+                className="login-password-toggle"
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                aria-pressed={showPassword}
+                onClick={() => setShowPassword((visible) => !visible)}
+              >
+                {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+              </button>
+            </span>
           </label>
-          {error && <p className="login-error"><AlertTriangle size={16} /> {error}</p>}
+          {error && (
+            <div className="login-error" role="alert">
+              <AlertTriangle size={16} />
+              <span>{error}<small>Safari may reuse an older saved password. Reveal the field and verify it before retrying.</small></span>
+            </div>
+          )}
           <button className="primary" disabled={submitting || !username.trim() || !password}>
             {submitting ? <Loader2 className="spin" size={18} /> : <ChevronRight size={18} />}
             {submitting ? "Signing in…" : "Sign in"}
@@ -1415,27 +1613,37 @@ function HomeDashboard({
   const [featurePaused, setFeaturePaused] = useState(false);
   const [featureInteracting, setFeatureInteracting] = useState(false);
   const [documentVisible, setDocumentVisible] = useState(!document.hidden);
+  const personalMatches = useMemo(() => {
+    const candidates = [...(discovery?.trending ?? []), ...(discovery?.popularThisSeason ?? [])];
+    const uniqueCandidates = [...new Map(candidates.map((item) => [item.catalogId, item])).values()];
+    return sortCatalogByPersonalMatch(uniqueCandidates);
+  }, [discovery?.trending, discovery?.popularThisSeason]);
   const featureSlides = useMemo<HomeFeatureSlide[]>(() => [
-    ...(discovery?.trending ?? []).slice(0, 10).map((item) => ({
-      id: `trending:${item.catalogId}`,
-      kind: "trending" as const,
+    ...personalMatches.slice(0, 10).map((item) => ({
+      id: `personal-match:${item.catalogId}`,
+      kind: "personalMatch" as const,
       title: item.title,
       image: item.bannerUrl || item.coverUrl || LOGO_SRC,
       description: plainDescription(item.description) || "Open the title, choose a provider, and see the episodes available to your family.",
-      context: "Trending on AniList",
+      context: item.personalMatch != null ? `${item.personalMatch}% personal match` : "Recommended for you",
       progress: 0,
       catalog: item,
     })),
-  ], [discovery?.trending]);
+  ], [personalMatches]);
   const featured = featureSlides[featureIndex] ?? featureSlides[0] ?? {
     id: "ani-desk",
-    kind: "trending" as const,
+    kind: "personalMatch" as const,
     title: "ani-desk",
     image: LOGO_SRC,
     description: "Choose one provider catalog, find an episode, and settle in.",
     context: "Private family theatre",
     progress: 0,
   };
+  const featuredTitleClass = featured.title.length > 72
+    ? "very-long"
+    : featured.title.length > 38
+      ? "long"
+      : undefined;
 
   useEffect(() => {
     setFeatureIndex((current) => Math.min(current, Math.max(0, featureSlides.length - 1)));
@@ -1451,7 +1659,7 @@ function HomeDashboard({
     if (shouldReduceMotion || featurePaused || featureInteracting || !documentVisible || featureSlides.length < 2) return undefined;
     const interval = window.setInterval(() => {
       setFeatureIndex((current) => (current + 1) % featureSlides.length);
-    }, 6500);
+    }, 4200);
     return () => window.clearInterval(interval);
   }, [shouldReduceMotion, featurePaused, featureInteracting, documentVisible, featureSlides.length]);
 
@@ -1509,7 +1717,7 @@ function HomeDashboard({
             transition={{ duration: shouldReduceMotion ? 0.15 : 0.28 }}
           >
             <p className="home-feature-context">{featured.context}</p>
-            <h1>{featured.title}</h1>
+            <h1 className={featuredTitleClass}>{featured.title}</h1>
             <p className="home-feature-description">{featured.description}</p>
             <div className="home-feature-actions">
               {featured.catalog ? (
@@ -1573,8 +1781,8 @@ function HomeDashboard({
           onRemove={onRemoveHistory}
         />
         <CatalogRow
-          title="Trending Now"
-          items={discovery?.trending ?? []}
+          title="Top Matches"
+          items={personalMatches}
           loading={!discovery}
           onOpen={onOpenCatalog}
           onShowMore={onShowCatalog}
@@ -1828,7 +2036,7 @@ function CatalogPage({
     <motion.section className="catalog-browser" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
       <header className="catalog-browser-header">
         <IconButton label="Back" onClick={onBack}><ArrowLeft size={21} /></IconButton>
-        <div><span>AniList discovery</span><h1>Trending catalog</h1><p>Refine the live catalog, then rank this page locally for your taste.</p></div>
+        <div><span>Ranked for you</span><h1>Personalized catalog</h1><p>Your strongest personal matches appear first. Refine the catalog or choose another order at any time.</p></div>
       </header>
       <div className="catalog-filter-bar">
         <label className="catalog-sort-control"><span>Order</span><select value={sort} onChange={(event) => { setPage(1); setSort(event.target.value); }} aria-label="Sort catalog">
@@ -1894,9 +2102,8 @@ function SearchStage({
   onLanguageChange,
   onProviderSelect,
   onProviderSourceSelect,
-  onOpenProviderAccess,
-  onCompleteProviderVerification,
-  providerAccessPending,
+  onProviderHealthRetry,
+  providerHealthPending,
   onSelectProviderResult,
   onSelectCatalog,
   onOpenAnime,
@@ -1921,9 +2128,8 @@ function SearchStage({
   onLanguageChange: (language: "english" | "vietnamese") => void;
   onProviderSelect: (option: ProviderAvailability) => void;
   onProviderSourceSelect: (source: Source) => void;
-  onOpenProviderAccess: (source: Source) => void;
-  onCompleteProviderVerification: (source: Source) => void;
-  providerAccessPending: string | null;
+  onProviderHealthRetry: (source: Source) => void;
+  providerHealthPending: string | null;
   onSelectProviderResult: (anime: Anime) => void;
   onSelectCatalog: (anime: CatalogAnime) => void;
   onOpenAnime: (anime: Anime) => void;
@@ -1952,9 +2158,6 @@ function SearchStage({
         episodes: selectedAnime?.totalEpisodes,
         category: selectedAnime?.provider ?? "Provider result",
       };
-  const recoverySource = selectedSource?.status === "unavailable" && (selectedSource.verificationUrl || selectedSource.websiteUrl)
-    ? selectedSource
-    : null;
 
   function setMobileSearchStep(previewOpen: boolean) {
     setMobilePreviewOpen(previewOpen);
@@ -1997,6 +2200,8 @@ function SearchStage({
             <Search size={20} />
             <input
               ref={inputRef}
+              type="search"
+              aria-label="Search anime, films, and OVAs"
               value={query}
               placeholder="Search anime, films, OVAs..."
               onChange={(event) => onQueryChange(event.target.value)}
@@ -2009,68 +2214,49 @@ function SearchStage({
         </div>
         <div className="search-source-row">
           <div className="language-switch" aria-label="Subtitle language">
-            <button className={languageGroup === "english" ? "active" : ""} onClick={() => onLanguageChange("english")}>English</button>
-            <button className={languageGroup === "vietnamese" ? "active" : ""} onClick={() => onLanguageChange("vietnamese")}>Vietnamese</button>
+            <button aria-pressed={languageGroup === "english"} className={languageGroup === "english" ? "active" : ""} onClick={() => onLanguageChange("english")}>English</button>
+            <button aria-pressed={languageGroup === "vietnamese"} className={languageGroup === "vietnamese" ? "active" : ""} onClick={() => onLanguageChange("vietnamese")}>Vietnamese</button>
           </div>
           <div className="availability-strip" aria-label="Available providers">
             {languageSources.map((source) => {
               const option = availability.find((item) => item.provider === source.name);
               const hasDirectResult = providerResults.some((anime) => anime.provider === source.name);
-              const recoverable = Boolean(source.verificationUrl || source.websiteUrl);
-              const enabled = source.capabilities.search && (source.status !== "unavailable" || recoverable);
+              const online = source.status === "healthy" && source.capabilities.search;
+              const checking = source.status === "unknown" || providerHealthPending === source.name;
               const isActive = selectedSource?.name === source.name || selectedAnime?.provider === source.name;
+              const actionLabel = !source.capabilities.search
+                ? "Unavailable"
+                : checking
+                  ? "Checking"
+                  : !online
+                    ? "Recheck"
+                  : (hasDirectResult ? "Results" : "Search");
               return (
                 <button
                   key={source.name}
                   className={isActive ? "provider-chip active" : "provider-chip"}
-                  disabled={!enabled}
+                  aria-label={`${source.name}: ${actionLabel}`}
+                  aria-pressed={isActive}
+                  disabled={!source.capabilities.search || checking}
                   title={source.failureCode || option?.failureCode || undefined}
-                  onClick={() => onProviderSourceSelect(source)}
+                  onClick={() => online ? onProviderSourceSelect(source) : onProviderHealthRetry(source)}
                 >
                   <i className={`health-dot ${source.status}`} />
                   <strong>{source.name}</strong>
-                  <span>{source.status === "unavailable" && source.verificationUrl ? "Verify / Xác minh" : enabled ? (hasDirectResult ? "Results" : "Search") : "Unavailable"}</span>
+                  <span>{actionLabel}</span>
                 </button>
               );
             })}
+            {!languageSources.length && (
+              <span className="source-empty" role="status">
+                No {languageGroup === "english" ? "English" : "Vietnamese"} providers available
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {recoverySource && (
-        <aside className="provider-recovery" aria-live="polite">
-          <div className="provider-recovery-icon"><AlertTriangle size={20} /></div>
-          <div>
-            <strong>{recoverySource.verificationUrl ? "Provider verification / Xác minh nguồn" : "Provider website / Trang nguồn"}</strong>
-            <p>
-              {recoverySource.verificationUrl
-                ? `Open ${recoverySource.name}, complete Cloudflare manually, then return here and retry. Mở ${recoverySource.name}, tự hoàn tất Cloudflare, sau đó quay lại và thử lại.`
-                : `${recoverySource.name} cannot play inside ani-desk right now. Open its website as a fallback. Hiện chưa thể phát ${recoverySource.name} trong ani-desk; hãy mở trang nguồn để xem thủ công.`}
-            </p>
-          </div>
-          <div className="provider-recovery-actions">
-            <button
-              onClick={() => onOpenProviderAccess(recoverySource)}
-              disabled={providerAccessPending !== null}
-            >
-              {providerAccessPending === `open:${recoverySource.name}` ? <Loader2 className="spin" size={16} /> : null}
-              Open site / Mở trang
-            </button>
-            {recoverySource.verificationUrl && (
-              <button
-                className="primary"
-                onClick={() => onCompleteProviderVerification(recoverySource)}
-                disabled={providerAccessPending !== null}
-              >
-                {providerAccessPending === `retry:${recoverySource.name}` ? <Loader2 className="spin" size={16} /> : null}
-                I finished — retry / Đã xong — thử lại
-              </button>
-            )}
-          </div>
-        </aside>
-      )}
-
-      {query.trim().length < 2 && !recoverySource && (
+      {query.trim().length < 2 && (
         <motion.section
           className="search-welcome"
           initial={{ opacity: 0 }}
@@ -2111,7 +2297,11 @@ function SearchStage({
         <div className={`search-layout${mobilePreviewOpen ? " mobile-preview-open" : ""}`}>
           <aside className="search-results-pane">
             <div className="pane-title">
-              <span>{selectedSource ? `${selectedSource.name} Results` : "Choose Provider"}</span>
+              <span>
+                {selectedSource
+                  ? `${selectedSource.name} Results`
+                  : `No ${languageGroup === "english" ? "English" : "Vietnamese"} provider available`}
+              </span>
               <strong>{providerResults.length}</strong>
             </div>
             {providerResults.map((anime, index) => {
@@ -2143,7 +2333,14 @@ function SearchStage({
             {loading && !providerResults.length ? (
               Array.from({ length: 9 }).map((_, index) => <div className="result-skeleton" key={index} />)
             ) : (
-              !providerResults.length && <EmptyPanel title={query.trim().length < 2 ? "ani-desk" : "No results"} compact />
+              !providerResults.length && (
+                <EmptyPanel
+                  title={!selectedSource
+                    ? `No ${languageGroup === "english" ? "English" : "Vietnamese"} provider available`
+                    : query.trim().length < 2 ? "ani-desk" : "No results"}
+                  compact
+                />
+              )
             )}
 
 
@@ -2225,6 +2422,7 @@ function HistoryPage({
   onOpen,
   onRemove,
   onBack,
+  onOpenSearch,
   myList,
   onToggleFavorite,
 }: {
@@ -2232,6 +2430,7 @@ function HistoryPage({
   onOpen: (item: WatchHistory) => void;
   onRemove: (item: WatchHistory) => void;
   onBack: () => void;
+  onOpenSearch: () => void;
   myList: Favorite[];
   onToggleFavorite: (item: WatchHistory) => void;
 }) {
@@ -2257,6 +2456,9 @@ function HistoryPage({
       filter={filter}
       sort={sort}
       empty="Nothing to resume yet."
+      emptyDescription="Start an episode and your progress will appear here on every signed-in device."
+      emptyActionLabel="Find something to watch"
+      onEmptyAction={onOpenSearch}
       onBack={onBack}
       onFilterChange={setFilter}
       onSortChange={setSort}
@@ -2282,11 +2484,13 @@ function MyListPage({
   onOpen,
   onRemove,
   onBack,
+  onOpenSearch,
 }: {
   items: Anime[];
   onOpen: (anime: Anime) => void;
   onRemove: (anime: Anime) => void;
   onBack: () => void;
+  onOpenSearch: () => void;
 }) {
   const [filter, setFilter] = useState("");
   const [sort, setSort] = useState<ShelfSort>("recent");
@@ -2309,7 +2513,10 @@ function MyListPage({
       count={items.length}
       filter={filter}
       sort={sort}
-      empty="Your My List is empty."
+      empty="Your list is ready for its first title"
+      emptyDescription="Search any provider, open a title, and add it here for quick access later."
+      emptyActionLabel="Search providers"
+      onEmptyAction={onOpenSearch}
       onBack={onBack}
       onFilterChange={setFilter}
       onSortChange={setSort}
@@ -2604,6 +2811,9 @@ function ShelfPageShell({
   filter,
   sort,
   empty,
+  emptyDescription,
+  emptyActionLabel,
+  onEmptyAction,
   onBack,
   onFilterChange,
   onSortChange,
@@ -2615,6 +2825,9 @@ function ShelfPageShell({
   filter: string;
   sort: ShelfSort;
   empty: string;
+  emptyDescription: string;
+  emptyActionLabel: string;
+  onEmptyAction: () => void;
   onBack: () => void;
   onFilterChange: (filter: string) => void;
   onSortChange: (sort: ShelfSort) => void;
@@ -2645,7 +2858,16 @@ function ShelfPageShell({
         </select>
       </div>
 
-      {count ? <div className="poster-grid">{children}</div> : <p className="empty-state">{empty}</p>}
+      {count ? (
+        <div className="poster-grid">{children}</div>
+      ) : (
+        <section className="shelf-empty-state" aria-labelledby="shelf-empty-title">
+          <div className="shelf-empty-icon" aria-hidden="true"><Search size={24} /></div>
+          <h2 id="shelf-empty-title">{empty}</h2>
+          <p>{emptyDescription}</p>
+          <button className="primary" onClick={onEmptyAction}><Search size={17} />{emptyActionLabel}</button>
+        </section>
+      )}
     </motion.section>
   );
 }
@@ -2924,6 +3146,9 @@ function DetailPage({
 
           <section className="episode-panel episode-list-panel">
             <div className="episode-heading">
+              <IconButton label="Back" className="mobile-detail-back" onClick={onBack}>
+                <ArrowLeft size={21} />
+              </IconButton>
               <div>
                 <h3>Episodes</h3>
                 <span>Range {activeRangeLabel} / {episodes.length} total</span>
@@ -2961,8 +3186,10 @@ function DetailPage({
               <label>
                 <Search size={17} />
                 <input
+                  type="search"
+                  aria-label="Find episode by number or title"
                   value={episodeQuery}
-                  placeholder="Find episode by number or title"
+                  placeholder="Episode number or title"
                   onChange={(event) => setEpisodeQuery(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key !== "Enter" || !/^\d+$/.test(episodeQuery.trim())) return;
@@ -3116,14 +3343,28 @@ function DetailPage({
   );
 }
 
-function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: () => void }) {
+function VideoPlayer({
+  context,
+  autoSkip,
+  onAutoSkipChange,
+  onPlayEpisode,
+  onClose,
+}: {
+  context: PlayerContext;
+  autoSkip: boolean;
+  onAutoSkipChange: (enabled: boolean) => void;
+  onPlayEpisode: (episode: Episode) => Promise<void>;
+  onClose: () => void;
+}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const dashRef = useRef<MediaPlayerClass | null>(null);
+  const subtitleTrackRefs = useRef<Array<HTMLTrackElement | null>>([]);
   const qualityRef = useRef("auto");
   const savingAtRef = useRef(0);
   const controlsTimerRef = useRef<number | null>(null);
   const skipFeedbackTimerRef = useRef<number | null>(null);
+  const skippedRangesRef = useRef(new Set<string>());
   const [error, setError] = useState<string | null>(null);
   const [quality, setQuality] = useState("auto");
   const [levels, setLevels] = useState<QualityLevel[]>([]);
@@ -3133,11 +3374,56 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [skipFeedback, setSkipFeedback] = useState<{ amount: number; id: number } | null>(null);
+  const [skipFeedback, setSkipFeedback] = useState<{ amount?: number; label?: string; id: number } | null>(null);
+  const [skipTimes, setSkipTimes] = useState<SkipTime[]>([]);
+  const [skipTimingStatus, setSkipTimingStatus] = useState<"loading" | "ready" | "unavailable" | "error">("loading");
+  const [switchingEpisode, setSwitchingEpisode] = useState(false);
   const streamIsHls = context.playback.streamKind === "hls" || context.playback.originalUrl.toLowerCase().includes(".m3u8");
   const streamIsDash = context.playback.streamKind === "dash" || context.playback.originalUrl.toLowerCase().includes(".mpd");
   const subtitleTracks = context.playback.subtitles.filter((item) => item.url);
   const [subtitle, setSubtitle] = useState(subtitleTracks.length ? "0" : "off");
+  const orderedEpisodes = useMemo(
+    () => [...context.episodes].sort((left, right) => left.number - right.number),
+    [context.episodes],
+  );
+  const episodeIndex = orderedEpisodes.findIndex((episode) => episode.id === context.episode.id);
+  const previousEpisode = episodeIndex > 0 ? orderedEpisodes[episodeIndex - 1] : null;
+  const nextEpisode = episodeIndex >= 0 && episodeIndex < orderedEpisodes.length - 1
+    ? orderedEpisodes[episodeIndex + 1]
+    : null;
+
+  useEffect(() => {
+    const nextSubtitle = subtitleTracks.length ? "0" : "off";
+    setSubtitle(nextSubtitle);
+    const frame = window.requestAnimationFrame(() => applySubtitleSelection(nextSubtitle));
+    return () => window.cancelAnimationFrame(frame);
+  }, [context.playback.sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    skippedRangesRef.current.clear();
+    setSkipTimes([]);
+    const skipNumber = context.episode.aniskipEpisodeNumber;
+    if (!context.anime.catalogId || !skipNumber) {
+      setSkipTimingStatus("unavailable");
+      return () => { cancelled = true; };
+    }
+    setSkipTimingStatus("loading");
+    void api.getSkipTimes(context.anime.catalogId, skipNumber)
+      .then((times) => {
+        if (!cancelled) {
+          setSkipTimes(times);
+          setSkipTimingStatus("ready");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSkipTimes([]);
+          setSkipTimingStatus("error");
+        }
+      });
+    return () => { cancelled = true; };
+  }, [context.anime.catalogId, context.episode.id, context.episode.aniskipEpisodeNumber]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -3171,7 +3457,9 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
     };
 
     const handleNativeError = () => {
-      if (!disposed) setError("The browser player could not decode this stream. Try mpv fallback.");
+      if (!disposed && !hlsRef.current && !dashRef.current) {
+        setError("The browser could not decode this stream. Try mpv fallback.");
+      }
     };
 
     video.addEventListener("error", handleNativeError);
@@ -3204,15 +3492,23 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
         if (!disposed) setError(`The DASH player could not start (${String(loadError)}).`);
       });
     } else if (streamIsHls) {
-      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      const startNativeHls = () => {
+        if (!video.canPlayType("application/vnd.apple.mpegurl")) {
+          setError("This browser cannot play HLS streams. Use mpv fallback.");
+          return;
+        }
         video.src = context.playback.playbackUrl;
         video.addEventListener("loadedmetadata", startPlayback, { once: true });
         video.load();
+      };
+
+      if (prefersNativeHls()) {
+        startNativeHls();
       } else {
         void import("hls.js").then(({ default: HlsRuntime }) => {
           if (disposed) return;
           if (!HlsRuntime.isSupported()) {
-            setError("This system WebView cannot play HLS streams. Use mpv fallback.");
+            startNativeHls();
             return;
           }
 
@@ -3241,7 +3537,12 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
             }
           });
         }).catch((loadError) => {
-          if (!disposed) setError(`The HLS player could not start (${String(loadError)}).`);
+          if (disposed) return;
+          if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            startNativeHls();
+          } else {
+            setError(`The HLS player could not start (${String(loadError)}). Use mpv fallback.`);
+          }
         });
       }
     } else {
@@ -3261,13 +3562,24 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
       video.removeAttribute("src");
       video.load();
     };
-  }, [context.playback.playbackUrl, context.playback.originalUrl, context.playback.streamKind, context.startTime, streamIsDash, streamIsHls]);
+  }, [context.playback.playbackUrl, context.playback.streamKind, context.startTime, streamIsDash, streamIsHls]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     const syncState = () => {
+      if (autoSkip && timingMatchesDuration(skipTimes, video.duration)) {
+        const range = skipTimes.find((item) => item.skipType === "op" && video.currentTime >= item.startTime && video.currentTime < item.endTime);
+        if (range) {
+          const rangeKey = `${range.skipType}:${range.startTime}:${range.endTime}`;
+          if (!skippedRangesRef.current.has(rangeKey)) {
+            skippedRangesRef.current.add(rangeKey);
+            video.currentTime = range.endTime;
+            showSkipFeedback(`Skipped ${skipTypeLabel(range.skipType)}`);
+          }
+        }
+      }
       setCurrentTime(video.currentTime || 0);
       setDuration(Number.isFinite(video.duration) ? video.duration : 0);
       setVolume(video.volume);
@@ -3287,7 +3599,7 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
       video.removeEventListener("pause", syncState);
       video.removeEventListener("volumechange", syncState);
     };
-  }, []);
+  }, [autoSkip, skipTimes]);
 
   useEffect(() => {
     const saveInterval = window.setInterval(() => {
@@ -3326,13 +3638,19 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
       } else if (event.key === "Escape") {
         event.preventDefault();
         void closePlayer();
+      } else if (event.key === "[") {
+        event.preventDefault();
+        if (previousEpisode) void changeEpisode(previousEpisode);
+      } else if (event.key === "]") {
+        event.preventDefault();
+        if (nextEpisode) void changeEpisode(nextEpisode);
       }
       revealControls();
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [volume, muted, isPlaying]);
+  }, [volume, muted, isPlaying, previousEpisode?.id, nextEpisode?.id, switchingEpisode]);
 
   useEffect(() => {
     revealControls();
@@ -3382,11 +3700,6 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
       });
   }
 
-  async function openMpv() {
-    const current = Math.floor(videoRef.current?.currentTime || context.startTime || 0);
-    await api.openInMpv(context.anime.provider, context.episode.id, current);
-  }
-
   function togglePlay() {
     const video = videoRef.current;
     if (!video) return;
@@ -3404,10 +3717,14 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
     const max = Number.isFinite(video.duration) ? video.duration : video.currentTime + seconds;
     video.currentTime = Math.max(0, Math.min(max, video.currentTime + seconds));
     setCurrentTime(video.currentTime);
-    setSkipFeedback({ amount: seconds, id: Date.now() });
+    showSkipFeedback(undefined, seconds);
+    void saveProgress(true);
+  }
+
+  function showSkipFeedback(label?: string, amount?: number) {
+    setSkipFeedback({ amount, label, id: Date.now() });
     if (skipFeedbackTimerRef.current) window.clearTimeout(skipFeedbackTimerRef.current);
     skipFeedbackTimerRef.current = window.setTimeout(() => setSkipFeedback(null), 850);
-    void saveProgress(true);
   }
 
   function setVideoVolume(nextVolume: number) {
@@ -3425,11 +3742,13 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
 
   function changeSubtitle(value: string) {
     setSubtitle(value);
-    const tracks = videoRef.current?.textTracks;
-    if (!tracks) return;
-    for (let index = 0; index < tracks.length; index += 1) {
-      tracks[index].mode = value === String(index) ? "showing" : "disabled";
-    }
+    applySubtitleSelection(value);
+  }
+
+  function applySubtitleSelection(value: string) {
+    subtitleTrackRefs.current.forEach((track, index) => {
+      if (track) track.track.mode = value === String(index) ? "showing" : "disabled";
+    });
   }
 
   async function toggleFullscreen() {
@@ -3471,7 +3790,24 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
     onClose();
   }
 
+  async function changeEpisode(episode: Episode) {
+    if (switchingEpisode || episode.id === context.episode.id) return;
+    setSwitchingEpisode(true);
+    await saveProgress(true).catch(() => undefined);
+    try {
+      await onPlayEpisode(episode);
+    } finally {
+      setSwitchingEpisode(false);
+    }
+  }
+
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const markerDuration = duration > 0
+    ? duration
+    : Math.max(0, ...skipTimes.map((item) => item.endTime));
+  const timelineSkipTimes = markerDuration > 0
+    ? skipTimes.filter((item) => item.startTime < markerDuration && item.endTime > 0)
+    : [];
 
   return (
     <motion.div
@@ -3494,11 +3830,15 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
         {subtitleTracks.map((item, index) => (
           <track
             key={item.url}
+            ref={(track) => { subtitleTrackRefs.current[index] = track; }}
             kind="subtitles"
             src={item.url}
             srcLang={languageCode(item.language)}
             label={item.language}
             default={index === 0}
+            onLoad={(event) => {
+              event.currentTarget.track.mode = subtitle === String(index) ? "showing" : "disabled";
+            }}
           />
         ))}
       </video>
@@ -3530,14 +3870,38 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
         />
       </div>
 
-      <div className="player-center">
-        <button onClick={() => seekBy(-10)} aria-label="Back 10 seconds">
+      <div className="player-center" role="group" aria-label="Playback controls">
+        <button
+          className="episode-transport"
+          onClick={() => previousEpisode && void changeEpisode(previousEpisode)}
+          disabled={!previousEpisode || switchingEpisode}
+          aria-label="Previous episode"
+          aria-busy={switchingEpisode}
+          data-state={switchingEpisode ? "loading" : undefined}
+          title="Previous episode ([)"
+        >
           <SkipBack size={30} />
+        </button>
+        <button className="seek-transport" onClick={() => seekBy(-10)} aria-label="Back 10 seconds" title="Back 10 seconds">
+          <RotateCcw size={34} />
+          <span className="seek-seconds" aria-hidden="true">10</span>
         </button>
         <button className="play-ring" onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"}>
           {isPlaying ? <Pause size={34} /> : <Play size={34} />}
         </button>
-        <button onClick={() => seekBy(10)} aria-label="Forward 10 seconds">
+        <button className="seek-transport" onClick={() => seekBy(10)} aria-label="Forward 10 seconds" title="Forward 10 seconds">
+          <RotateCw size={34} />
+          <span className="seek-seconds" aria-hidden="true">10</span>
+        </button>
+        <button
+          className="episode-transport"
+          onClick={() => nextEpisode && void changeEpisode(nextEpisode)}
+          disabled={!nextEpisode || switchingEpisode}
+          aria-label="Next episode"
+          aria-busy={switchingEpisode}
+          data-state={switchingEpisode ? "loading" : undefined}
+          title="Next episode (])"
+        >
           <SkipForward size={30} />
         </button>
         <AnimatePresence mode="wait">
@@ -3552,7 +3916,7 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
               role="status"
               aria-live="polite"
             >
-              {skipFeedback.amount > 0 ? "+" : "−"}{Math.abs(skipFeedback.amount)} seconds
+              {skipFeedback.label ?? `${(skipFeedback.amount ?? 0) > 0 ? "+" : "−"}${Math.abs(skipFeedback.amount ?? 0)} seconds`}
             </motion.div>
           ) : null}
         </AnimatePresence>
@@ -3562,7 +3926,6 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
         {error && (
           <div className="player-error-fallback">
             <span>{error}</span>
-            {context.playback.canFallbackToMpv && <button onClick={() => void openMpv()}>Open fallback player</button>}
           </div>
         )}
         <div className="player-control-row">
@@ -3582,6 +3945,20 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
               {levels.map((level) => <option value={String(level.index)} key={level.index}>{level.label}</option>)}
             </select>
             </label>
+            <button
+              className="player-auto-skip-toggle"
+              type="button"
+              role="switch"
+              aria-checked={autoSkip}
+              aria-busy={skipTimingStatus === "loading"}
+              data-state={skipTimingStatus === "error" ? "error" : skipTimingStatus === "ready" ? "success" : skipTimingStatus}
+              disabled={skipTimingStatus === "loading"}
+              aria-label="Toggle skip intro"
+              title={skipTimingStatusLabel(skipTimingStatus, skipTimes.length)}
+              onClick={() => onAutoSkipChange(!autoSkip)}
+            >
+              Skip intro <span>{autoSkip ? "On" : "Off"}</span>
+            </button>
             {subtitleTracks.length > 0 && (
               <label title="Subtitles">
                 <span>Subtitles</span>
@@ -3595,28 +3972,49 @@ function VideoPlayer({ context, onClose }: { context: PlayerContext; onClose: ()
         </div>
         <div className="player-timeline">
           <span>{formatTime(currentTime)}</span>
-          <input
-            className="player-progress"
-            type="range"
-            min={0}
-            max={duration || 0}
-            step={1}
-            value={Math.min(currentTime, duration || currentTime)}
-            style={{ "--progress": `${progress}%` } as React.CSSProperties}
-            onChange={(event) => {
-              const video = videoRef.current;
-              if (!video) return;
-              video.currentTime = Number(event.target.value);
-              setCurrentTime(video.currentTime);
-            }}
-            onMouseUp={() => void saveProgress(true)}
-          />
+          <div className="player-progress-shell">
+            <div className="player-skip-markers" role="list" aria-label="Opening and ending timeline markers">
+              {timelineSkipTimes.map((item) => {
+                const start = Math.max(0, Math.min(100, item.startTime / markerDuration * 100));
+                const end = Math.max(start, Math.min(100, item.endTime / markerDuration * 100));
+                return (
+                  <span
+                    key={`${item.skipType}:${item.startTime}:${item.endTime}`}
+                    className={`player-skip-marker ${item.skipType}`}
+                    role="listitem"
+                    aria-label={`${skipTypeDisplayLabel(item.skipType)}, ${formatTime(item.startTime)} to ${formatTime(item.endTime)}`}
+                    style={{ insetInlineStart: `${start}%`, width: `${Math.max(0.35, end - start)}%` }}
+                    title={`${skipTypeDisplayLabel(item.skipType)} · ${formatTime(item.startTime)}–${formatTime(item.endTime)}`}
+                  >
+                    <span className="sr-only">{skipTypeDisplayLabel(item.skipType)}</span>
+                  </span>
+                );
+              })}
+            </div>
+            <input
+              className="player-progress"
+              type="range"
+              min={0}
+              max={duration || 0}
+              step={1}
+              value={Math.min(currentTime, duration || currentTime)}
+              style={{ "--progress": `${progress}%` } as React.CSSProperties}
+              onChange={(event) => {
+                const video = videoRef.current;
+                if (!video) return;
+                video.currentTime = Number(event.target.value);
+                setCurrentTime(video.currentTime);
+              }}
+              onMouseUp={() => void saveProgress(true)}
+            />
+          </div>
           <span>-{formatTime(Math.max(0, duration - currentTime))}</span>
         </div>
       </div>
     </motion.div>
   );
 }
+
 
 function EmptyPanel({ title, compact = false }: { title: string; compact?: boolean }) {
   return (
@@ -3694,12 +4092,55 @@ function catalogOnlyAnime(catalog: CatalogAnime): Anime {
   };
 }
 
-function firstSearchableSource(sources: Source[], group: "english" | "vietnamese") {
-  return (
-    sources.find((source) => source.languageGroup === group && source.status !== "unavailable" && source.capabilities.search) ??
-    sources.find((source) => source.languageGroup === group) ??
-    null
+function exactCatalogMatch(catalog: CatalogAnime[], anime: Anime): CatalogAnime | null {
+  return exactCatalogTitleMatch(catalog, anime.title);
+}
+
+function exactCatalogTitleMatch(catalog: CatalogAnime[], title: string): CatalogAnime | null {
+  const normalizedTitle = normalizeCatalogTitle(title);
+  if (!normalizedTitle) return null;
+  const matches = catalog.filter((item) =>
+    [item.title, item.nativeTitle, ...(item.synonyms ?? [])].some(
+      (candidate) => normalizeCatalogTitle(candidate ?? "") === normalizedTitle,
+    ),
   );
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function normalizeCatalogTitle(title: string) {
+  return title
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function sortCatalogByPersonalMatch(items: CatalogAnime[]): CatalogAnime[] {
+  return [...items].sort((left, right) => {
+    const matchDifference = (right.personalMatch ?? right.score ?? 0) - (left.personalMatch ?? left.score ?? 0);
+    if (matchDifference !== 0) return matchDifference;
+    const scoreDifference = (right.score ?? 0) - (left.score ?? 0);
+    if (scoreDifference !== 0) return scoreDifference;
+    return left.title.localeCompare(right.title);
+  });
+}
+
+function firstSearchableSource(sources: Source[], group: "english" | "vietnamese") {
+  return sources.find(
+    (source) => source.languageGroup === group && source.status === "healthy" && source.capabilities.search,
+  ) ?? null;
+}
+
+function providerFailureMakesOffline(error: AppError) {
+  return new Set([
+    "PROVIDER_UNAVAILABLE",
+    "PROVIDER_CAPTCHA",
+    "PROVIDER_RATE_LIMITED",
+    "NETWORK_TIMEOUT",
+    "STREAM_NOT_FOUND",
+    "STREAM_FORBIDDEN",
+  ]).has(error.code);
 }
 
 function episodeDownloadKey(anime: Anime, episode: Episode) {
@@ -3769,7 +4210,7 @@ function saveSourceName(sourceName: string) {
 function loadSavedTheme(): AppTheme {
   try {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
-    if (saved === "obsidian" || saved === "oled" || saved === "system") return saved;
+    if (saved === "obsidian" || saved === "oled" || saved === "ember" || saved === "crimson" || saved === "system") return saved;
   } catch {
     // localStorage can be unavailable in restricted WebView contexts.
   }
@@ -3787,7 +4228,7 @@ function saveTheme(theme: AppTheme) {
 function loadSavedScale(): AppScale {
   try {
     const saved = localStorage.getItem(APP_SCALE_STORAGE_KEY);
-    if (saved === "compact" || saved === "comfortable" || saved === "large") return saved;
+    if (saved === "compact" || saved === "comfortable" || saved === "large" || saved === "tv") return saved;
   } catch {
     // localStorage can be unavailable in restricted WebView contexts.
   }
@@ -3818,6 +4259,60 @@ function saveFont(font: AppFont) {
   } catch {
     // localStorage can be unavailable in restricted WebView contexts.
   }
+}
+
+function loadSavedAutoSkip() {
+  try {
+    const saved =
+      localStorage.getItem(SKIP_INTRO_STORAGE_KEY) ??
+      localStorage.getItem("any-watch:auto-skip") ??
+      localStorage.getItem("ani-desk:auto-skip");
+    return saved === null ? true : saved !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveAutoSkip(enabled: boolean) {
+  try {
+    localStorage.setItem(SKIP_INTRO_STORAGE_KEY, String(enabled));
+  } catch {
+    // localStorage can be unavailable in restricted WebView contexts.
+  }
+}
+
+function skipTypeLabel(skipType: string) {
+  if (skipType === "op") return "opening";
+  if (skipType === "ed") return "ending";
+  if (skipType === "recap") return "recap";
+  return "segment";
+}
+
+function skipTypeDisplayLabel(skipType: string) {
+  if (skipType === "op") return "Opening";
+  if (skipType === "ed") return "Ending";
+  if (skipType === "recap") return "Recap";
+  return "Skip segment";
+}
+
+function skipTimingStatusLabel(status: "loading" | "ready" | "unavailable" | "error", count: number) {
+  if (status === "loading") return "Loading timing data";
+  if (status === "error") return "Timing unavailable";
+  if (status === "unavailable") return "No catalog match";
+  return count ? `${count} marked segment${count === 1 ? "" : "s"}` : "No marked segments";
+}
+
+function timingMatchesDuration(times: SkipTime[], duration: number) {
+  if (!Number.isFinite(duration) || duration <= 0) return false;
+  const expected = times.find((item) => item.episodeLength && Number.isFinite(item.episodeLength))?.episodeLength;
+  return expected == null || Math.abs(duration - expected) <= Math.max(20, expected * 0.03);
+}
+
+function prefersNativeHls() {
+  const userAgent = navigator.userAgent;
+  const isSafari = /Safari\//.test(userAgent);
+  const isChromium = /(Chrome|Chromium|CriOS|Edg|OPR)\//.test(userAgent);
+  return isSafari && !isChromium;
 }
 
 function applyHlsQuality(hls: Hls | null, quality: string) {
